@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: chemrag
+      POSTGRES_USER: chemrag
+      POSTGRES_PASSWORD: chemrag
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./storage/postgres:/var/lib/postgresql/data
+      - ./backend/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: chemrag
+      MINIO_ROOT_PASSWORD: chemrag-secret
+    ports:
+      - "9100:9000"
+      - "9101:9001"
+    volumes:
+      - ./storage/minio:/data
