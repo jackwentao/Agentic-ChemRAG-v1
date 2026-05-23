@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     api_port: int = 8000
 
     database_url: str = "postgresql+psycopg://chemrag:chemrag@localhost:5432/chemrag"
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = "redis://localhost:6380/0"
     upload_dir: Path = Path("storage/uploads")
     image_dir: Path = Path("storage/images")
     model_cache_dir: Path = Path("storage/models")
@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     router_warmup_on_startup: bool = True
     evaluation_warmup: bool = True
     object_storage_provider: str = "minio"
-    minio_endpoint: str = "localhost:9000"
+    minio_endpoint: str = "localhost:9100"
     minio_access_key: str = "chemrag"
     minio_secret_key: str = "chemrag-secret"
     minio_bucket: str = "chemrag"
@@ -39,13 +39,13 @@ class Settings(BaseSettings):
     embedding_model: str = "BAAI/bge-m3"
     embedding_dim: int = Field(default=1024, gt=0)
     embedding_device: str = "cpu"
-    embedding_local_files_only: bool = True
+    embedding_local_files_only: bool = False
 
     reranker_enabled: bool = True
     reranker_provider: str = "local_bge"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     reranker_device: str = "cpu"
-    reranker_local_files_only: bool = True
+    reranker_local_files_only: bool = False
     reranker_chunk_candidates: int = Field(default=30, gt=0)
     reranker_figure_candidates: int = Field(default=32, gt=0)
     reranker_warmup_on_startup: bool = True

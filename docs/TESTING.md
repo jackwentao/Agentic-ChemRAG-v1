@@ -1,139 +1,141 @@
-# Testing Guide
+# 测试与启动验证指南
 
-## Fast Checks
+## 自动化检查
+
+后端单元与集成测试：
 
 ```powershell
-pytest
+.\.venv\Scripts\python.exe -m pytest
 ```
 
-Current coverage:
-
-- parent-child chunking
-- deterministic fake embeddings
-- ingestion service composition
-- LangGraph RAG workflow
-- FastAPI health endpoint
-- batch upload accepts valid PDFs while rejecting invalid files per item
-- duplicate pending/running uploads reuse existing documents without duplicate tasks
-
-## Frontend Build
+前端生产构建：
 
 ```powershell
 cd frontend
 npm run build
 ```
 
-## RAG Quality Evaluation
+测试当前覆盖父子切块、嵌入提供器、上传去重、图片元数据、路由与重排、评估指标、问答接口，以及真实 API 冒烟脚本的请求流程。
 
-The evaluation suite uses manually labeled golden cases to report retrieval quality,
-answer quality, figure hit quality, route accuracy, and latency. It reports metrics
-only; it does not fail on quality thresholds in v1.
+## 默认基础服务配置
 
-```powershell
-.\.venv\Scripts\python.exe scripts\evaluate_rag.py --cases eval\golden_cases.jsonl --output-dir eval\reports --llm-judge off
-```
+本地应用通过 Docker 对外暴露的端口访问基础设施，以下值必须一致：
 
-For offline retrieval/route regression without calling the configured answer LLM:
+| 服务 | Docker 映射 | 应用配置 |
+| --- | --- | --- |
+| PostgreSQL | `localhost:5432` | `DATABASE_URL=postgresql+psycopg://chemrag:chemrag@localhost:5432/chemrag` |
+| Redis | `localhost:6380 -> 6379` | `REDIS_URL=redis://localhost:6380/0` |
+| MinIO API | `localhost:9100 -> 9000` | `MINIO_ENDPOINT=localhost:9100` |
+| MinIO Console | `localhost:9101 -> 9001` | 浏览器管理界面，可选使用 |
 
-```powershell
-.\.venv\Scripts\python.exe scripts\evaluate_rag.py --cases eval\golden_cases.jsonl --output-dir eval\reports --llm-judge off --answer-provider fake
-```
-
-Router prototype embeddings are warmed before timed cases by default. To measure cold-start latency explicitly:
+检查当前读取到的 `.env` 配置：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\evaluate_rag.py --cases eval\golden_cases.jsonl --output-dir eval\reports --llm-judge off --answer-provider fake --warmup off
+.\.venv\Scripts\python.exe scripts\check_env.py
 ```
 
-Optional LLM-as-judge mode reuses the configured DeepSeek/OpenAI-compatible settings:
+## 从零启动并验证上传问答
 
-```powershell
-.\.venv\Scripts\python.exe scripts\evaluate_rag.py --cases eval\golden_cases.jsonl --output-dir eval\reports --llm-judge on
-```
-
-Outputs:
-
-- `eval/reports/latest.json`
-- `eval/reports/latest.md`
-
-## Manual Smoke Test
-
-Windows setup with all runtime data under this project directory:
+### 1. 初始化
 
 ```powershell
 .\scripts\setup_windows.ps1
 ```
 
-Start infrastructure:
+脚本会安装后端与前端依赖、创建 `.env`（仅在文件不存在时）、启动 `postgres`、`redis`、`minio`，并运行后端测试。真实 `.env` 不进入 Git。
 
-```powershell
-docker compose up -d postgres redis
+### 2. 编辑环境变量
+
+在 `.env` 中配置真实的 `DEEPSEEK_API_KEY`，并确认：
+
+```dotenv
+REDIS_URL=redis://localhost:6380/0
+OBJECT_STORAGE_PROVIDER=minio
+MINIO_ENDPOINT=localhost:9100
+EMBEDDING_LOCAL_FILES_ONLY=false
+RERANKER_LOCAL_FILES_ONLY=false
 ```
 
-Redis is mapped to `localhost:6380` to avoid conflicts with other local RAG stacks using `6379`.
+首次运行需要下载嵌入与重排模型，因此应保留两项 `false`。模型下载完成后，离线运行时可将其改为 `true`。
 
-Start API:
+### 3. 确认基础设施已运行
 
 ```powershell
+docker compose up -d postgres redis minio
+docker compose ps
+.\.venv\Scripts\python.exe scripts\check_env.py
+```
+
+若上传立即失败，请优先检查 MinIO 是否启动以及 `.env` 的 `MINIO_ENDPOINT` 是否仍为旧端口；若任务一直无法开始，请检查 Redis URL 是否为 `6380`。
+
+### 4. 分终端启动服务
+
+```powershell
+# 终端 1
 .\scripts\start_api.ps1
 ```
 
-Start Celery:
-
 ```powershell
+# 终端 2
 .\scripts\start_worker.ps1
 ```
 
-Start UI:
-
 ```powershell
+# 终端 3
 .\scripts\start_frontend.ps1
 ```
 
-Then open `http://127.0.0.1:5173`.
-
-## Required Environment
-
-Copy `.env.example` to `.env`, then set:
-
-- `DEEPSEEK_API_KEY`
-- `DEEPSEEK_MODEL`
-- `EMBEDDING_MODEL=BAAI/bge-m3`
-- `EMBEDDING_DEVICE=cpu` or `cuda`
-- `MODEL_CACHE_DIR=storage/models`
-- `ROUTER_CACHE_DIR=storage/router_cache`
-- `RERANKER_MODEL=BAAI/bge-reranker-v2-m3`
-- `RERANKER_DEVICE=cpu` or `cuda`
-
-For Windows, keep the project on `D:` if you do not want runtime data on `C:`.
-The current compose file stores Postgres data in `./storage/postgres`, not a Docker named volume.
-
-## Environment Check
+API 健康检查：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/check_env.py
+Invoke-RestMethod http://127.0.0.1:8000/api/health
 ```
 
-## Real PDF Smoke Test
+预期返回：
 
-After Postgres and Redis are running:
+```text
+status
+------
+ok
+```
+
+### 5. 验证真实上传与提问
+
+推荐先运行自动冒烟验证，它会实际经过 API、MinIO、Redis/Celery、PostgreSQL 和问答流程：
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/smoke_ingest_and_chat.py ".\Photoluminescence and Nonlinear Optical Properties of Transition Metal (Ag, Ni, Mn) Doped ZnO Nanoparticles(科研通-ablesci.com).pdf"
+.\.venv\Scripts\python.exe scripts\smoke_api_flow.py ".\你的论文.pdf" --question "该论文报告了哪些关键实验结果？"
 ```
 
-## Acceptance Baseline
+验收条件：
 
-Before using this project in a resume, verify:
+- 输出 `上传成功` 与 `索引完成`。
+- 输出的切块数大于 `0`。
+- 输出非空回答。
+- 输出的引用数量大于 `0`。
 
-- Uploading a PDF returns a task id.
-- Uploading multiple PDFs returns one result per file, and one invalid file does not fail the whole batch.
-- Task status eventually becomes `success`.
-- `/api/documents` shows the indexed document and chunk count.
-- Refreshing the UI shows previously uploaded documents without uploading again.
-- Re-uploading the same PDF returns the existing document instead of creating a duplicate.
-- References/Bibliography text is not inserted as retrieval child chunks.
-- Current-document chat refuses to run without a selected document.
-- Asking a question returns an answer.
-- Every answer includes at least one citation with page number and quote.
-- `pytest` and `npm run build` pass.
+随后可打开 `http://127.0.0.1:5173`，上传或选择文档并在界面重复提问。
+
+## 质量评估
+
+离线检索与路由回归评估：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_rag.py --cases eval\golden_cases.jsonl --output-dir eval\reports --llm-judge off --answer-provider fake
+```
+
+使用已配置回答模型进行评估：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_rag.py --cases eval\golden_cases.jsonl --output-dir eval\reports --llm-judge off
+```
+
+评估结果输出至被 Git 忽略的 `eval/reports/`，不会污染提交基线。
+
+## 排错顺序
+
+1. `docker compose ps`：确认 `postgres`、`redis`、`minio` 正在运行。
+2. `scripts\check_env.py`：确认 Redis 指向 `6380`、MinIO 指向 `9100`、API Key 已配置。
+3. API 终端日志：确认模型是否仍在首次下载或加载失败。
+4. Worker 终端日志：确认 Celery 能连接 Redis 并完成索引任务。
+5. `scripts\smoke_api_flow.py`：重新执行完整链路验证，获得最直接的失败步骤。
