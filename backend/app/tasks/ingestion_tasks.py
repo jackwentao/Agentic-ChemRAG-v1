@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from backend.app.config import get_settings
+from backend.app.database import build_database_engine
 from backend.app.parsing.chunker import ParentChildChunker
 from backend.app.parsing.parser import PyMuPDFParser
 from backend.app.providers.embeddings import build_embedding_provider
@@ -20,19 +21,23 @@ def ingest_document(
     file_size: int | None = None,
 ) -> int:
     settings = get_settings()
-    repository = PgVectorRepository(settings.database_url)
-    repository.update_document_indexing_status(document_id, "running")
-    service = IngestionService(
-        parser=PyMuPDFParser(),
-        chunker=ParentChildChunker(),
-        embedding_provider=build_embedding_provider(settings),
-        repository=repository,
-        image_store=ObjectImageStore(build_object_storage(settings)),
-    )
+    engine = build_database_engine(settings.database_url)
+    repository = PgVectorRepository(engine)
     try:
-        chunk_count = service.ingest(document_id, Path(file_path), filename=filename, file_hash=file_hash, file_size=file_size)
-    except Exception as exc:
-        repository.update_document_indexing_status(document_id, "failed", error=str(exc))
-        raise
-    repository.update_document_indexing_status(document_id, "succeeded")
-    return chunk_count
+        repository.update_document_indexing_status(document_id, "running")
+        service = IngestionService(
+            parser=PyMuPDFParser(),
+            chunker=ParentChildChunker(),
+            embedding_provider=build_embedding_provider(settings),
+            repository=repository,
+            image_store=ObjectImageStore(build_object_storage(settings)),
+        )
+        try:
+            chunk_count = service.ingest(document_id, Path(file_path), filename=filename, file_hash=file_hash, file_size=file_size)
+        except Exception as exc:
+            repository.update_document_indexing_status(document_id, "failed", error=str(exc))
+            raise
+        repository.update_document_indexing_status(document_id, "succeeded")
+        return chunk_count
+    finally:
+        engine.dispose()

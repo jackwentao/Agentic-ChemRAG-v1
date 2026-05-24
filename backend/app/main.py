@@ -7,6 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.app.api.dependencies import get_query_router, get_reranker_provider
 from backend.app.api.routers import assets, chat, documents, maintenance
 from backend.app.config import get_settings
+from backend.app.database import build_database_engine, prepare_database
+from backend.app.repositories.postgres import PgVectorRepository
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -36,9 +38,17 @@ def warmup_reranker_on_startup() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    warmup_router_on_startup()
-    warmup_reranker_on_startup()
-    yield
+    engine = build_database_engine(settings.database_url)
+    try:
+        prepare_database(engine)
+        app.state.repository = PgVectorRepository(engine)
+        warmup_router_on_startup()
+        warmup_reranker_on_startup()
+        yield
+    finally:
+        if hasattr(app.state, "repository"):
+            del app.state.repository
+        engine.dispose()
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)

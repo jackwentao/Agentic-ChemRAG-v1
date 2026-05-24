@@ -15,7 +15,7 @@ cd frontend
 npm run build
 ```
 
-测试当前覆盖父子切块、嵌入提供器、上传去重、图片元数据、路由与重排、评估指标、问答接口，以及真实 API 冒烟脚本的请求流程。
+测试当前覆盖父子切块、嵌入提供器、上传去重、图片元数据、数据库启动准备与 FastAPI 仓储生命周期、路由与重排、评估指标、问答接口，以及真实 API 冒烟脚本的请求流程。
 
 ## 默认基础服务配置
 
@@ -69,6 +69,12 @@ docker compose ps
 若上传立即失败，请优先检查 MinIO 是否启动以及 `.env` 的 `MINIO_ENDPOINT` 是否仍为旧端口；若任务一直无法开始，请检查 Redis URL 是否为 `6380`。
 
 ### 4. 分终端启动服务
+
+在部署流程中可提前执行数据库结构准备；API 启动时也会幂等执行同一准备函数：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\prepare_database.py
+```
 
 ```powershell
 # 终端 1

@@ -6,8 +6,9 @@
 
 ## 模块边界
 
-- `backend/app/main.py` 只装配 FastAPI 应用、中间件、路由和启动预热，不承载具体接口业务。
-- `backend/app/api/dependencies.py` 统一管理依赖注入；复用 repository、对象存储和 provider，并按请求构建带可变诊断状态的检索服务与 graph。
+- `backend/app/main.py` 只装配 FastAPI 应用、中间件、路由、数据库生命周期和启动预热，不承载具体接口业务。
+- `backend/app/database.py` 管理数据库引擎创建与模式准备；同一准备函数可由应用启动和部署脚本复用。
+- `backend/app/api/dependencies.py` 统一管理依赖注入；读取 FastAPI 托管的 repository，复用对象存储和 provider，并按请求构建带可变诊断状态的检索服务与 graph。
 - `backend/app/api/routers/documents.py` 提供上传、批量上传和文档列表接口。
 - `backend/app/api/routers/chat.py` 提供问答编排、作用域解析和引用响应映射。
 - `backend/app/api/routers/assets.py` 提供 PDF 与图片资产读取接口。
@@ -30,7 +31,11 @@ domain -> no project dependency
 
 ## 依赖生命周期
 
-`PgVectorRepository`、对象存储客户端、embedding/LLM/reranker provider 与 `QueryRouter` 通过缓存依赖复用，从而避免在每个 HTTP 请求中重复初始化引擎或模型。
+FastAPI `lifespan` 在接收请求前建立数据库引擎、执行 `prepare_database()` 并将单个 `PgVectorRepository` 存放在 `app.state` 中；请求依赖只读取该对象。停止应用时统一释放引擎，因此接口请求既不创建连接池，也不执行模式升级。
+
+部署流水线也可执行 `scripts/prepare_database.py`，使用相同的准备函数先行升级数据库。Celery 任务与离线脚本只按工作需要创建数据访问对象，不隐式改变数据库结构。
+
+对象存储客户端、embedding/LLM/reranker provider 与 `QueryRouter` 通过缓存依赖复用，从而避免在每个 HTTP 请求中重复初始化客户端或模型。
 
 `RetrievalService` 与 `MultiAgentRagGraph` 按请求创建，因为检索服务保存本次请求的 `last_*_diagnostics`；如果全局复用，会使并发请求相互覆盖观测数据。
 

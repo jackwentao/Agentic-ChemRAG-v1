@@ -1,7 +1,7 @@
 from io import BytesIO
 
 from fastapi.testclient import TestClient
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 import pytest
 
 import backend.app.api.dependencies as dependencies
@@ -177,17 +177,15 @@ def test_image_asset_streams_object_storage_content():
     assert response.headers["content-type"] == "image/png"
 
 
-def test_repository_dependency_reuses_single_instance(monkeypatch):
-    built_urls = []
+def test_repository_dependency_uses_fastapi_managed_instance():
+    repository = object()
+    app.state.repository = repository
+    request = Request({"type": "http", "app": app})
 
-    class FakeRepository:
-        def __init__(self, database_url: str):
-            built_urls.append(database_url)
-
-    monkeypatch.setattr(dependencies, "PgVectorRepository", FakeRepository)
-
-    assert dependencies.get_repository() is dependencies.get_repository()
-    assert built_urls == [dependencies.get_settings().database_url]
+    try:
+        assert dependencies.get_repository(request) is repository
+    finally:
+        del app.state.repository
 
 
 def test_chat_response_includes_selected_citation_images():
@@ -306,3 +304,26 @@ def test_startup_reranker_warmup_failure_does_not_block_startup(monkeypatch):
     monkeypatch.setattr(main_module, "get_reranker_provider", lambda: FakeReranker())
 
     main_module.warmup_reranker_on_startup()
+
+
+def test_lifespan_prepares_database_and_manages_repository(monkeypatch):
+    events = []
+
+    class FakeEngine:
+        def dispose(self):
+            events.append("dispose")
+
+    fake_engine = FakeEngine()
+
+    monkeypatch.setattr(main_module, "build_database_engine", lambda database_url: fake_engine)
+    monkeypatch.setattr(main_module, "prepare_database", lambda engine: events.append(("prepare", engine)))
+    monkeypatch.setattr(main_module, "warmup_router_on_startup", lambda: None)
+    monkeypatch.setattr(main_module, "warmup_reranker_on_startup", lambda: None)
+
+    with TestClient(app):
+        assert isinstance(app.state.repository, main_module.PgVectorRepository)
+        assert app.state.repository.engine is fake_engine
+        assert events == [("prepare", fake_engine)]
+
+    assert not hasattr(app.state, "repository")
+    assert events == [("prepare", fake_engine), "dispose"]

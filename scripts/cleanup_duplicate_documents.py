@@ -5,6 +5,7 @@ from pathlib import Path
 import psycopg
 
 from backend.app.config import get_settings
+from backend.app.database import build_database_engine
 from backend.app.parsing.chunker import ParentChildChunker
 from backend.app.parsing.parser import PyMuPDFParser
 from backend.app.providers.embeddings import build_embedding_provider
@@ -45,7 +46,7 @@ def main() -> None:
         clear_index_for_document(conn, args.keep_document_id)
         conn.commit()
 
-    repository = PgVectorRepository(settings.database_url)
+    repository = PgVectorRepository(build_database_engine(settings.database_url))
     repository.update_document_hash(args.keep_document_id, file_hash, file_size, upload_path.name)
     service = IngestionService(
         parser=PyMuPDFParser(),

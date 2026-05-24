@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.app.agents.rag_graph import MultiAgentRagGraph
 from backend.app.config import get_settings
+from backend.app.database import build_database_engine
 from backend.app.domain.documents import Evidence, EvidenceImage
 from backend.app.evaluation.cases import GoldenCase, load_golden_cases
 from backend.app.evaluation.judge import LlmJudge
@@ -46,7 +47,7 @@ def main() -> None:
         warmup_info["reranker_warmup_latency_ms"] = (perf_counter() - rerank_started_at) * 1000
     else:
         warmup_info["reranker_warmup_latency_ms"] = 0.0
-    repository = PgVectorRepository(settings.database_url)
+    repository = PgVectorRepository(build_database_engine(settings.database_url))
     graph = MultiAgentRagGraph(
         RetrievalService(
             repository,

@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, Request
 
 from backend.app.agents.rag_graph import MultiAgentRagGraph
 from backend.app.config import Settings, get_settings
@@ -18,10 +18,9 @@ from backend.app.tasks.ingestion_tasks import ingest_document
 DEFAULT_OWNER_ID = "demo"
 
 
-@lru_cache(maxsize=1)
-def get_repository() -> PgVectorRepository:
-    """复用数据库引擎与建表检查，避免每个请求重复初始化。"""
-    return PgVectorRepository(get_settings().database_url)
+def get_repository(request: Request) -> PgVectorRepository:
+    """返回由 FastAPI 生命周期统一创建和释放的数据库仓储。"""
+    return request.app.state.repository
 
 
 @lru_cache(maxsize=1)
