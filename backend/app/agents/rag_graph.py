@@ -4,6 +4,12 @@ from langgraph.graph import END, StateGraph
 
 from backend.app.agents.state import RagGraphState
 from backend.app.domain.documents import Evidence, EvidenceImage
+from backend.app.observability.diagnostics import (
+    build_llm_diagnostics,
+    build_route_diagnostics,
+    set_total_latency,
+    update_stage_proxy_hit,
+)
 from backend.app.providers.llm import LlmProvider
 from backend.app.routing.query_router import QueryRouter, RouteContext
 from backend.app.services.rag import RetrievalService
@@ -33,7 +39,8 @@ class MultiAgentRagGraph:
         document_ids: list[str] | None = None,
         scope: str | None = None,
     ) -> RagGraphState:
-        return self.graph.invoke(
+        started_at = perf_counter()
+        state = self.graph.invoke(
             {
                 "question": question,
                 "document_ids": document_ids,
@@ -41,6 +48,13 @@ class MultiAgentRagGraph:
                 "warnings": [],
             }
         )
+        total_latency_ms = (perf_counter() - started_at) * 1000
+        diagnostics = set_total_latency(state.get("diagnostics"), total_latency_ms)
+        return {
+            **state,
+            "total_latency_ms": total_latency_ms,
+            "diagnostics": diagnostics,
+        }
 
     def _build(self) -> StateGraph:
         graph = StateGraph(RagGraphState)
@@ -58,11 +72,27 @@ class MultiAgentRagGraph:
         return graph
 
     def _planner(self, state: RagGraphState) -> RagGraphState:
+        started_at = perf_counter()
         context = RouteContext(
             scope=state.get("scope") or ("current_document" if state.get("document_ids") else "all_documents"),
             document_ids=state.get("document_ids"),
         )
         decision = self.query_router.route(state["question"], context)
+        route_latency_ms = (perf_counter() - started_at) * 1000
+        diagnostics = {
+            **state.get("diagnostics", {}),
+            "route": build_route_diagnostics(
+                latency_ms=route_latency_ms,
+                selected_route=decision.route,
+                confidence=decision.confidence,
+                needs_llm_router=decision.needs_llm_router,
+                is_multi_step=decision.is_multi_step,
+                scores=decision.scores,
+                lexical_scores=decision.lexical_scores,
+                semantic_scores=decision.semantic_scores,
+                rationale=decision.rationale,
+            ),
+        }
         return {
             **state,
             "route": decision.route,
@@ -73,7 +103,9 @@ class MultiAgentRagGraph:
             "route_rationale": decision.rationale,
             "needs_llm_router": decision.needs_llm_router,
             "is_multi_step": decision.is_multi_step,
+            "route_latency_ms": route_latency_ms,
             "plan": _plan_for_route(decision.route),
+            "diagnostics": diagnostics,
         }
 
     def _retriever(self, state: RagGraphState) -> RagGraphState:
@@ -103,6 +135,11 @@ class MultiAgentRagGraph:
             "retrieval_latency_ms": (perf_counter() - started_at) * 1000,
             "rerank_latency_ms": getattr(self.retrieval_service, "last_rerank_latency_ms", 0.0),
             "rerank_enabled": getattr(self.retrieval_service, "last_rerank_enabled", False),
+            "diagnostics": {
+                **state.get("diagnostics", {}),
+                "recall": getattr(self.retrieval_service, "last_recall_diagnostics", {}),
+                "rerank": getattr(self.retrieval_service, "last_rerank_diagnostics", {}),
+            },
         }
 
     def _verifier(self, state: RagGraphState) -> RagGraphState:
@@ -111,29 +148,68 @@ class MultiAgentRagGraph:
         warnings = state.get("warnings", [])
         if not verified:
             warnings = [*warnings, "No evidence was retrieved."]
-        return {**state, "verified_evidence": verified, "warnings": warnings}
+        diagnostics = update_stage_proxy_hit(state.get("diagnostics"), "route", bool(verified))
+        diagnostics = update_stage_proxy_hit(diagnostics, "recall", bool(verified))
+        return {**state, "verified_evidence": verified, "warnings": warnings, "diagnostics": diagnostics}
 
     def _answerer(self, state: RagGraphState) -> RagGraphState:
         started_at = perf_counter()
+        used_llm = state.get("route") not in {"figure_index", "document_profile"}
         if state.get("route") == "figure_index":
             answer = _answer_from_figure_index(state.get("verified_evidence", []))
-            return {**state, "answer": answer, "answer_latency_ms": (perf_counter() - started_at) * 1000}
+            latency_ms = (perf_counter() - started_at) * 1000
+            diagnostics = {
+                **state.get("diagnostics", {}),
+                "llm": build_llm_diagnostics(
+                    latency_ms=latency_ms,
+                    used_llm=used_llm,
+                    answer_chars=len(answer),
+                    evidence_count=len(state.get("verified_evidence", [])),
+                    citation_count=len(state.get("verified_evidence", [])),
+                ),
+            }
+            return {**state, "answer": answer, "answer_latency_ms": latency_ms, "diagnostics": diagnostics}
         if state.get("route") == "document_profile":
             answer = _answer_from_document_profiles(state["question"], state.get("verified_evidence", []))
-            return {**state, "answer": answer, "answer_latency_ms": (perf_counter() - started_at) * 1000}
+            latency_ms = (perf_counter() - started_at) * 1000
+            diagnostics = {
+                **state.get("diagnostics", {}),
+                "llm": build_llm_diagnostics(
+                    latency_ms=latency_ms,
+                    used_llm=used_llm,
+                    answer_chars=len(answer),
+                    evidence_count=len(state.get("verified_evidence", [])),
+                    citation_count=len(state.get("verified_evidence", [])),
+                ),
+            }
+            return {**state, "answer": answer, "answer_latency_ms": latency_ms, "diagnostics": diagnostics}
         answer = self.llm_provider.answer_with_evidence(state["question"], state.get("verified_evidence", []))
-        return {**state, "answer": answer, "answer_latency_ms": (perf_counter() - started_at) * 1000}
+        latency_ms = (perf_counter() - started_at) * 1000
+        diagnostics = {
+            **state.get("diagnostics", {}),
+            "llm": build_llm_diagnostics(
+                latency_ms=latency_ms,
+                used_llm=used_llm,
+                answer_chars=len(answer),
+                evidence_count=len(state.get("verified_evidence", [])),
+                citation_count=len(state.get("verified_evidence", [])),
+            ),
+        }
+        return {**state, "answer": answer, "answer_latency_ms": latency_ms, "diagnostics": diagnostics}
 
     def _image_selector(self, state: RagGraphState) -> RagGraphState:
         if state.get("route") == "figure_index":
-            return {**state, "selected_images": _select_first_figure_images(state.get("verified_evidence", []), max_images=3)}
+            selected = _select_first_figure_images(state.get("verified_evidence", []), max_images=3)
+            diagnostics = _with_selected_image_count(state.get("diagnostics"), selected)
+            return {**state, "selected_images": selected, "diagnostics": diagnostics}
         selected = self.llm_provider.select_images_for_answer(
             state["question"],
             state.get("answer", ""),
             state.get("verified_evidence", []),
             max_images=3,
         )
-        return {**state, "selected_images": selected}
+        diagnostics = _with_selected_image_count(state.get("diagnostics"), selected)
+        return {**state, "selected_images": selected, "diagnostics": diagnostics}
 
 
 def _plan_for_route(route: str) -> str:
@@ -194,3 +270,16 @@ def _select_first_figure_images(evidence: list[Evidence], max_images: int) -> di
         ]
         count += 1
     return selected
+
+
+def _with_selected_image_count(
+    diagnostics: dict[str, object] | None,
+    selected_images: dict[str, list[EvidenceImage]],
+) -> dict[str, object]:
+    payload = dict(diagnostics or {})
+    llm = dict(payload.get("llm", {}))
+    if not llm:
+        return payload
+    llm["selected_image_count"] = sum(len(images) for images in selected_images.values())
+    payload["llm"] = llm
+    return payload

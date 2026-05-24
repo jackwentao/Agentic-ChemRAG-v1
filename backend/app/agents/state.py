@@ -16,12 +16,15 @@ class RagGraphState(TypedDict, total=False):
     route_rationale: list[str]
     needs_llm_router: bool
     is_multi_step: bool
+    route_latency_ms: float
     evidence: list[Evidence]
     verified_evidence: list[Evidence]
     selected_images: dict[str, list[EvidenceImage]]
     answer: str
+    total_latency_ms: float
     retrieval_latency_ms: float
     rerank_latency_ms: float
     rerank_enabled: bool
     answer_latency_ms: float
+    diagnostics: dict[str, object]
     warnings: list[str]

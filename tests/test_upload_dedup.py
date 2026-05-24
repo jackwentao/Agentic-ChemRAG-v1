@@ -1,7 +1,6 @@
 from hashlib import sha256
 
-import backend.app.main as main_module
-from backend.app.main import _find_existing_document_by_storage_hash, _store_uploaded_pdf
+from backend.app.services.documents import DocumentService
 
 
 class FakeDocumentRepository:
@@ -75,6 +74,23 @@ class FakeTaskQueue:
         return Result()
 
 
+class FakeObjectStorage:
+    def __init__(self) -> None:
+        self.stored = []
+
+    def put_bytes(self, key: str, data: bytes, content_type: str) -> None:
+        self.stored.append((key, data, content_type))
+
+
+def build_service(repository, upload_dir, task_queue=None) -> DocumentService:
+    return DocumentService(
+        repository=repository,
+        object_storage=FakeObjectStorage(),
+        upload_dir=upload_dir,
+        ingestion_task=task_queue or FakeTaskQueue(),
+    )
+
+
 def test_find_existing_document_by_storage_hash_backfills_hash(tmp_path):
     content = b"pdf bytes"
     file_hash = sha256(content).hexdigest()
@@ -84,7 +100,9 @@ def test_find_existing_document_by_storage_hash_backfills_hash(tmp_path):
         [{"document_id": "doc1", "filename": "paper.pdf", "chunk_count": 3, "is_indexed": True}]
     )
 
-    document = _find_existing_document_by_storage_hash(repository, file_hash, len(content), upload_dir, "paper.pdf")
+    document = build_service(repository, upload_dir).find_existing_document_by_storage_hash(
+        file_hash, len(content), "paper.pdf"
+    )
 
     assert document is not None
     assert document["document_id"] == "doc1"
@@ -105,20 +123,19 @@ def test_find_existing_document_by_storage_hash_ignores_different_content(tmp_pa
     (upload_dir / "doc1.pdf").write_bytes(b"other bytes")
     repository = FakeDocumentRepository([{"document_id": "doc1", "filename": "paper.pdf"}])
 
-    document = _find_existing_document_by_storage_hash(repository, sha256(content).hexdigest(), len(content), upload_dir)
+    document = build_service(repository, upload_dir).find_existing_document_by_storage_hash(
+        sha256(content).hexdigest(), len(content)
+    )
 
     assert document is None
     assert repository.updated is None
 
 
-def test_store_uploaded_pdf_schedules_new_document(tmp_path, monkeypatch):
+def test_store_uploaded_pdf_schedules_new_document(tmp_path):
     task_queue = FakeTaskQueue()
     repository = FakeDocumentRepository([])
-    monkeypatch.setattr(main_module.settings, "upload_dir", tmp_path)
-    monkeypatch.setattr(main_module, "ingest_document", task_queue)
-    monkeypatch.setattr(main_module, "_store_pdf_object", lambda pdf_key, content: None)
 
-    response = _store_uploaded_pdf("paper.pdf", b"pdf bytes", repository)
+    response = build_service(repository, tmp_path, task_queue).store_uploaded_pdf("paper.pdf", b"pdf bytes")
 
     assert response.status == "pending"
     assert response.task_id == "task-1"
@@ -127,7 +144,7 @@ def test_store_uploaded_pdf_schedules_new_document(tmp_path, monkeypatch):
     assert len(task_queue.calls) == 1
 
 
-def test_store_uploaded_pdf_reuses_pending_document_without_duplicate_task(tmp_path, monkeypatch):
+def test_store_uploaded_pdf_reuses_pending_document_without_duplicate_task(tmp_path):
     file_hash = sha256(b"pdf bytes").hexdigest()
     task_queue = FakeTaskQueue()
     repository = FakeDocumentRepository(
@@ -141,11 +158,7 @@ def test_store_uploaded_pdf_reuses_pending_document_without_duplicate_task(tmp_p
             }
         ]
     )
-    monkeypatch.setattr(main_module.settings, "upload_dir", tmp_path)
-    monkeypatch.setattr(main_module, "ingest_document", task_queue)
-    monkeypatch.setattr(main_module, "_store_pdf_object", lambda pdf_key, content: None)
-
-    response = _store_uploaded_pdf("paper.pdf", b"pdf bytes", repository)
+    response = build_service(repository, tmp_path, task_queue).store_uploaded_pdf("paper.pdf", b"pdf bytes")
 
     assert response.document_id == "doc1"
     assert response.status == "running"
@@ -154,14 +167,11 @@ def test_store_uploaded_pdf_reuses_pending_document_without_duplicate_task(tmp_p
     assert task_queue.calls == []
 
 
-def test_store_uploaded_pdf_marks_document_failed_when_task_enqueue_fails(tmp_path, monkeypatch):
+def test_store_uploaded_pdf_marks_document_failed_when_task_enqueue_fails(tmp_path):
     task_queue = FakeTaskQueue(should_fail=True)
     repository = FakeDocumentRepository([])
-    monkeypatch.setattr(main_module.settings, "upload_dir", tmp_path)
-    monkeypatch.setattr(main_module, "ingest_document", task_queue)
-    monkeypatch.setattr(main_module, "_store_pdf_object", lambda pdf_key, content: None)
 
-    response = _store_uploaded_pdf("paper.pdf", b"pdf bytes", repository)
+    response = build_service(repository, tmp_path, task_queue).store_uploaded_pdf("paper.pdf", b"pdf bytes")
 
     assert response.status == "failed"
     assert response.task_id is None

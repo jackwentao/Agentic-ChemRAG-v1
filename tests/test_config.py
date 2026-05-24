@@ -18,6 +18,9 @@ def test_default_models_allow_first_run_download():
 
     assert settings.embedding_local_files_only is False
     assert settings.reranker_local_files_only is False
+    assert settings.reranker_chunk_candidates == 10
+    assert settings.reranker_figure_candidates == 10
+    assert settings.reranker_min_candidates == 10
 
 
 def test_windows_setup_starts_minio_with_other_dependencies():

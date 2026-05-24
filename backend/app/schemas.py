@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DocumentUploadResponse(BaseModel):
@@ -74,7 +74,70 @@ class Citation(BaseModel):
     images: list[CitationImage] = []
 
 
+class RouteDiagnostics(BaseModel):
+    latency_ms: float = 0.0
+    selected_route: str
+    confidence: float = 0.0
+    needs_llm_router: bool = False
+    is_multi_step: bool = False
+    proxy_hit: bool = False
+    scores: dict[str, float] = Field(default_factory=dict)
+    lexical_scores: dict[str, float] = Field(default_factory=dict)
+    semantic_scores: dict[str, float] = Field(default_factory=dict)
+    rationale: list[str] = Field(default_factory=list)
+
+
+class RecallDiagnostics(BaseModel):
+    mode: str
+    latency_ms: float = 0.0
+    embedding_latency_ms: float = 0.0
+    search_latency_ms: float = 0.0
+    candidate_count: int = 0
+    returned_count: int = 0
+    hit: bool = False
+    proxy_hit: bool = False
+    top_score: float | None = None
+    avg_score: float | None = None
+
+
+class RerankDiagnostics(BaseModel):
+    enabled: bool = False
+    latency_ms: float = 0.0
+    candidate_build_latency_ms: float = 0.0
+    inference_latency_ms: float = 0.0
+    postprocess_latency_ms: float = 0.0
+    candidate_count: int = 0
+    returned_count: int = 0
+    input_char_count: int = 0
+    avg_candidate_chars: float = 0.0
+    changed_top1: bool = False
+    changed_top_k: bool = False
+    top1_term_overlap_before: int = 0
+    top1_term_overlap_after: int = 0
+    skip_reason: str | None = None
+    proxy_hit: bool = False
+
+
+class LlmDiagnostics(BaseModel):
+    latency_ms: float = 0.0
+    used_llm: bool = False
+    answer_chars: int = 0
+    evidence_count: int = 0
+    citation_count: int = 0
+    selected_image_count: int = 0
+    proxy_hit: bool = False
+
+
+class ChatDiagnostics(BaseModel):
+    total_latency_ms: float = 0.0
+    route: RouteDiagnostics | None = None
+    recall: RecallDiagnostics | None = None
+    rerank: RerankDiagnostics | None = None
+    llm: LlmDiagnostics | None = None
+
+
 class ChatResponse(BaseModel):
     answer: str
     citations: list[Citation]
     warnings: list[str] = []
+    diagnostics: ChatDiagnostics | None = None

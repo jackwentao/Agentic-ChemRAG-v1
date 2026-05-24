@@ -46,8 +46,9 @@ class Settings(BaseSettings):
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     reranker_device: str = "cpu"
     reranker_local_files_only: bool = False
-    reranker_chunk_candidates: int = Field(default=30, gt=0)
-    reranker_figure_candidates: int = Field(default=32, gt=0)
+    reranker_chunk_candidates: int = Field(default=10, gt=0)
+    reranker_figure_candidates: int = Field(default=10, gt=0)
+    reranker_min_candidates: int = Field(default=10, gt=0)
     reranker_warmup_on_startup: bool = True
 
 

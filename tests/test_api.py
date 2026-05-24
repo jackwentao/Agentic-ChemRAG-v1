@@ -1,10 +1,14 @@
+from io import BytesIO
+
 from fastapi.testclient import TestClient
 from fastapi import HTTPException
 import pytest
 
+import backend.app.api.dependencies as dependencies
 import backend.app.main as main_module
+from backend.app.api.routers.maintenance import task_status
 from backend.app.domain.documents import Evidence, EvidenceImage
-from backend.app.main import app, task_status
+from backend.app.main import app
 from backend.app.providers.embeddings import FakeEmbeddingProvider
 from backend.app.providers.llm import FakeLlmProvider
 from backend.app.routing.query_router import QueryRouter, RouterWarmupStatus
@@ -19,8 +23,9 @@ def clear_cached_app_dependencies():
 
 
 def _clear_dependency_caches():
-    for name in ("_get_embedding_provider", "_get_llm_provider", "_get_query_router", "_get_reranker_provider"):
-        dependency = getattr(main_module, name)
+    app.dependency_overrides.clear()
+    for name in ("get_repository", "get_object_storage", "get_embedding_provider", "get_llm_provider", "get_query_router", "get_reranker_provider"):
+        dependency = getattr(dependencies, name)
         if hasattr(dependency, "cache_clear"):
             dependency.cache_clear()
 
@@ -34,12 +39,12 @@ def test_health_endpoint():
     assert response.json() == {"status": "ok"}
 
 
-def test_batch_upload_accepts_valid_pdfs_and_rejects_invalid_files(monkeypatch):
-    def fake_store(filename, content, repository):
-        return DocumentUploadResponse(document_id=f"doc-{filename}", task_id="task-1", status="pending")
+def test_batch_upload_accepts_valid_pdfs_and_rejects_invalid_files():
+    class FakeDocumentService:
+        def store_uploaded_pdf(self, filename, content):
+            return DocumentUploadResponse(document_id=f"doc-{filename}", task_id="task-1", status="pending")
 
-    monkeypatch.setattr(main_module, "_store_uploaded_pdf", fake_store)
-    monkeypatch.setattr(main_module, "PgVectorRepository", lambda database_url: object())
+    app.dependency_overrides[dependencies.get_document_service] = FakeDocumentService
     client = TestClient(app)
 
     response = client.post(
@@ -71,7 +76,7 @@ def test_batch_upload_accepts_valid_pdfs_and_rejects_invalid_files(monkeypatch):
     ]
 
 
-def test_task_status_returns_failure_error(monkeypatch):
+def test_task_status_returns_failure_error():
     class FailedResult:
         status = "FAILURE"
         result = RuntimeError("parse failed")
@@ -86,23 +91,19 @@ def test_task_status_returns_failure_error(monkeypatch):
         def AsyncResult(self, task_id):
             return FailedResult()
 
-    monkeypatch.setattr(main_module, "ingest_document", FakeTask())
-
-    response = task_status("task-1")
+    response = task_status("task-1", FakeTask())
 
     assert response.status == "failure"
     assert response.error == "parse failed"
 
 
-def test_task_status_raises_503_when_result_backend_is_unavailable(monkeypatch):
+def test_task_status_raises_503_when_result_backend_is_unavailable():
     class FakeTask:
         def AsyncResult(self, task_id):
             raise RuntimeError("redis unavailable")
 
-    monkeypatch.setattr(main_module, "ingest_document", FakeTask())
-
     try:
-        task_status("task-1")
+        task_status("task-1", FakeTask())
     except HTTPException as exc:
         assert exc.status_code == 503
         assert "Task status backend is unavailable" in exc.detail
@@ -110,7 +111,7 @@ def test_task_status_raises_503_when_result_backend_is_unavailable(monkeypatch):
         raise AssertionError("Expected HTTPException")
 
 
-def test_mark_stale_indexing_failed_uses_demo_owner(monkeypatch):
+def test_mark_stale_indexing_failed_uses_demo_owner():
     class FakeRepository:
         def __init__(self, database_url):
             self.database_url = database_url
@@ -120,7 +121,7 @@ def test_mark_stale_indexing_failed_uses_demo_owner(monkeypatch):
             assert stale_after_minutes == 30
             return ["doc1", "doc2"]
 
-    monkeypatch.setattr(main_module, "PgVectorRepository", FakeRepository)
+    app.dependency_overrides[dependencies.get_repository] = lambda: FakeRepository("test-database")
     client = TestClient(app)
 
     response = client.post("/api/maintenance/indexing/mark-stale-failed?timeout_minutes=30")
@@ -129,7 +130,67 @@ def test_mark_stale_indexing_failed_uses_demo_owner(monkeypatch):
     assert response.json() == {"updated": 2, "document_ids": ["doc1", "doc2"]}
 
 
-def test_chat_response_includes_selected_citation_images(monkeypatch):
+def test_pdf_asset_streams_object_storage_content():
+    class FakeRepository:
+        def get_document_asset(self, document_id: str):
+            assert document_id == "doc1"
+            return {"filename": "paper.pdf", "pdf_object_key": "documents/doc1.pdf"}
+
+    class FakeStorage:
+        def exists(self, key: str):
+            assert key == "documents/doc1.pdf"
+            return True
+
+        def open(self, key: str):
+            return BytesIO(b"%PDF stored")
+
+    app.dependency_overrides[dependencies.get_repository] = FakeRepository
+    app.dependency_overrides[dependencies.get_object_storage] = FakeStorage
+    response = TestClient(app).get("/api/documents/doc1/pdf")
+
+    assert response.status_code == 200
+    assert response.content == b"%PDF stored"
+    assert response.headers["content-type"] == "application/pdf"
+    assert "paper.pdf" in response.headers["content-disposition"]
+
+
+def test_image_asset_streams_object_storage_content():
+    class FakeRepository:
+        def get_image_asset(self, image_id: str):
+            assert image_id == "img1"
+            return {"path": "images/img1.png", "extension": "png"}
+
+    class FakeStorage:
+        def exists(self, key: str):
+            assert key == "images/img1.png"
+            return True
+
+        def open(self, key: str):
+            return BytesIO(b"png bytes")
+
+    app.dependency_overrides[dependencies.get_repository] = FakeRepository
+    app.dependency_overrides[dependencies.get_object_storage] = FakeStorage
+    response = TestClient(app).get("/api/images/img1")
+
+    assert response.status_code == 200
+    assert response.content == b"png bytes"
+    assert response.headers["content-type"] == "image/png"
+
+
+def test_repository_dependency_reuses_single_instance(monkeypatch):
+    built_urls = []
+
+    class FakeRepository:
+        def __init__(self, database_url: str):
+            built_urls.append(database_url)
+
+    monkeypatch.setattr(dependencies, "PgVectorRepository", FakeRepository)
+
+    assert dependencies.get_repository() is dependencies.get_repository()
+    assert built_urls == [dependencies.get_settings().database_url]
+
+
+def test_chat_response_includes_selected_citation_images():
     embedding_provider = FakeEmbeddingProvider(dimensions=8)
 
     class FakeRepository:
@@ -159,11 +220,11 @@ def test_chat_response_includes_selected_citation_images(monkeypatch):
                 )
             ]
 
-    monkeypatch.setattr(main_module, "PgVectorRepository", FakeRepository)
-    monkeypatch.setattr(main_module, "_get_embedding_provider", lambda: embedding_provider)
-    monkeypatch.setattr(main_module, "_get_llm_provider", lambda: FakeLlmProvider())
-    monkeypatch.setattr(main_module, "_get_query_router", lambda: QueryRouter(embedding_provider, cache_enabled=False))
-    monkeypatch.setattr(main_module, "_get_reranker_provider", lambda: None)
+    app.dependency_overrides[dependencies.get_repository] = lambda: FakeRepository("test-database")
+    app.dependency_overrides[dependencies.get_embedding_provider] = lambda: embedding_provider
+    app.dependency_overrides[dependencies.get_llm_provider] = lambda: FakeLlmProvider()
+    app.dependency_overrides[dependencies.get_query_router] = lambda: QueryRouter(embedding_provider, cache_enabled=False)
+    app.dependency_overrides[dependencies.get_reranker_provider] = lambda: None
     client = TestClient(app)
 
     response = client.post(
@@ -172,7 +233,8 @@ def test_chat_response_includes_selected_citation_images(monkeypatch):
     )
 
     assert response.status_code == 200
-    citation = response.json()["citations"][0]
+    payload = response.json()
+    citation = payload["citations"][0]
     assert citation["image_ids"] == ["img1"]
     assert citation["source_url"] == "/api/documents/doc1/pdf#page=4"
     assert citation["images"][0] == {
@@ -186,6 +248,9 @@ def test_chat_response_includes_selected_citation_images(monkeypatch):
         "caption": "Figure 1. SEM image of porous nanosheets.",
         "reason": "Selected by fake provider from candidate evidence images.",
     }
+    assert payload["diagnostics"]["route"]["selected_route"] == "chunk_search"
+    assert payload["diagnostics"]["recall"]["candidate_count"] == 1
+    assert payload["diagnostics"]["llm"]["proxy_hit"] is True
 
 
 def test_startup_warmup_uses_cached_query_router(monkeypatch):
@@ -197,7 +262,7 @@ def test_startup_warmup_uses_cached_query_router(monkeypatch):
             return RouterWarmupStatus(cache_enabled=True, status="disk_hit", latency_ms=1.0)
 
     monkeypatch.setattr(main_module.settings, "router_warmup_on_startup", True)
-    monkeypatch.setattr(main_module, "_get_query_router", lambda: FakeRouter())
+    monkeypatch.setattr(main_module, "get_query_router", lambda: FakeRouter())
 
     main_module.warmup_router_on_startup()
 
@@ -210,7 +275,7 @@ def test_startup_warmup_failure_does_not_block_startup(monkeypatch):
             raise RuntimeError("cache unavailable")
 
     monkeypatch.setattr(main_module.settings, "router_warmup_on_startup", True)
-    monkeypatch.setattr(main_module, "_get_query_router", lambda: FakeRouter())
+    monkeypatch.setattr(main_module, "get_query_router", lambda: FakeRouter())
 
     main_module.warmup_router_on_startup()
 
@@ -224,7 +289,7 @@ def test_startup_reranker_warmup_uses_cached_provider(monkeypatch):
 
     monkeypatch.setattr(main_module.settings, "reranker_enabled", True)
     monkeypatch.setattr(main_module.settings, "reranker_warmup_on_startup", True)
-    monkeypatch.setattr(main_module, "_get_reranker_provider", lambda: FakeReranker())
+    monkeypatch.setattr(main_module, "get_reranker_provider", lambda: FakeReranker())
 
     main_module.warmup_reranker_on_startup()
 
@@ -238,6 +303,6 @@ def test_startup_reranker_warmup_failure_does_not_block_startup(monkeypatch):
 
     monkeypatch.setattr(main_module.settings, "reranker_enabled", True)
     monkeypatch.setattr(main_module.settings, "reranker_warmup_on_startup", True)
-    monkeypatch.setattr(main_module, "_get_reranker_provider", lambda: FakeReranker())
+    monkeypatch.setattr(main_module, "get_reranker_provider", lambda: FakeReranker())
 
     main_module.warmup_reranker_on_startup()

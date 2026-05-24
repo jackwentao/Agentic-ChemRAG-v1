@@ -55,6 +55,7 @@ def main() -> None:
             reranker_enabled=settings.reranker_enabled,
             reranker_chunk_candidates=settings.reranker_chunk_candidates,
             reranker_figure_candidates=settings.reranker_figure_candidates,
+            reranker_min_candidates=settings.reranker_min_candidates,
         ),
         FakeLlmProvider() if args.answer_provider == "fake" or not settings.deepseek_api_key else build_llm_provider(settings),
         retrieval_top_k=args.top_k,
@@ -89,7 +90,7 @@ def evaluate_cases(
         document_ids = _document_ids_for_case(case, scope_override)
         started_at = perf_counter()
         state = graph.invoke(case.question, document_ids=document_ids)
-        total_latency_ms = (perf_counter() - started_at) * 1000
+        total_latency_ms = float(state.get("total_latency_ms", (perf_counter() - started_at) * 1000))
         evidence = list(state.get("verified_evidence", []))
         selected_images = _flatten_selected_images(state.get("selected_images", {}), evidence)
         citations = _citations_from_evidence(evidence)
@@ -117,6 +118,7 @@ def evaluate_cases(
             "citations": citations,
             "selected_images": selected_images,
             "retrieved_evidence": [_evidence_to_dict(item) for item in evidence],
+            "diagnostics": state.get("diagnostics", {}),
             "metrics": metrics,
             "latency_total_ms": total_latency_ms,
             "latency_retrieval_ms": float(state.get("retrieval_latency_ms", 0.0)),
@@ -404,7 +406,11 @@ def _needs_llm_router_lines(results: list[dict[str, Any]]) -> list[str]:
 def _slowest_lines(results: list[dict[str, Any]]) -> list[str]:
     lines = ["", "## Slowest Cases", ""]
     for result in sorted(results, key=lambda item: item["latency_total_ms"], reverse=True)[:5]:
-        lines.append(f"- `{result['case']['case_id']}` total={_fmt(result['latency_total_ms'])} ms")
+        rerank = result.get("diagnostics", {}).get("rerank", {})
+        lines.append(
+            f"- `{result['case']['case_id']}` total={_fmt(result['latency_total_ms'])} ms "
+            f"rerank={_fmt(rerank.get('latency_ms', 0.0))} ms candidates={rerank.get('candidate_count', 0)}"
+        )
     return lines
 
 

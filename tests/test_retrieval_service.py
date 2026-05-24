@@ -63,6 +63,7 @@ def test_retrieve_uses_candidate_pool_and_reranks_to_top_k():
         reranker_provider=FakeRerankerProvider(),
         reranker_enabled=True,
         reranker_chunk_candidates=30,
+        reranker_min_candidates=1,
     )
 
     results = service.retrieve("ZnO photoluminescence", top_k=1)
@@ -71,6 +72,11 @@ def test_retrieve_uses_candidate_pool_and_reranks_to_top_k():
     assert results[0].chunk_id == "c1"
     assert service.last_rerank_enabled is True
     assert service.last_rerank_latency_ms >= 0
+    assert service.last_recall_diagnostics["candidate_count"] == 4
+    assert service.last_recall_diagnostics["returned_count"] == 1
+    assert service.last_rerank_diagnostics["candidate_count"] == 4
+    assert service.last_rerank_diagnostics["inference_latency_ms"] >= 0
+    assert service.last_rerank_diagnostics["skip_reason"] is None
 
 
 class FigureRepository:
@@ -124,6 +130,7 @@ def test_retrieve_figures_reranks_captioned_nlo_figure_above_title_page():
         reranker_provider=FakeRerankerProvider(),
         reranker_enabled=True,
         reranker_figure_candidates=32,
+        reranker_min_candidates=1,
     )
 
     results = service.retrieve_figures("What figures describe nonlinear optical responses?", top_k=1)
@@ -159,3 +166,26 @@ def test_document_profile_retrieval_does_not_call_reranker():
 
     assert results[0].chunk_id == "profile:doc"
     assert service.last_rerank_enabled is False
+    assert service.last_recall_diagnostics["mode"] == "document_profile"
+    assert service.last_rerank_diagnostics["enabled"] is True
+    assert service.last_rerank_diagnostics["returned_count"] == 0
+
+
+def test_retrieve_skips_rerank_when_candidates_are_below_threshold():
+    repository = VectorOnlyRepository()
+    service = RetrievalService(
+        repository,
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_provider=FakeRerankerProvider(),
+        reranker_enabled=True,
+        reranker_chunk_candidates=10,
+        reranker_min_candidates=10,
+    )
+
+    results = service.retrieve("ZnO photoluminescence", top_k=3)
+
+    assert [item.chunk_id for item in results] == ["c0", "c1", "c2"]
+    assert service.last_rerank_enabled is False
+    assert service.last_rerank_diagnostics["enabled"] is False
+    assert service.last_rerank_diagnostics["skip_reason"] == "insufficient_candidates"
+    assert service.last_rerank_diagnostics["candidate_count"] == 4

@@ -29,6 +29,10 @@ def test_multi_agent_rag_graph_returns_answer_and_evidence():
     assert state["verified_evidence"]
     assert state["verified_evidence"][0].chunk_id == "c1"
     assert "route_scores" in state
+    assert state["diagnostics"]["route"]["latency_ms"] >= 0
+    assert state["diagnostics"]["recall"]["candidate_count"] >= 1
+    assert state["diagnostics"]["llm"]["answer_chars"] > 0
+    assert state["total_latency_ms"] >= 0
 
 
 class ImageCandidateRepository:
@@ -93,6 +97,8 @@ def test_multi_agent_rag_graph_routes_figure_questions_to_figure_index():
     assert state["route_confidence"] > 0
     assert "Figure 1" in state["answer"]
     assert state["selected_images"]["figure:img1"][0].image_id == "img1"
+    assert state["diagnostics"]["llm"]["used_llm"] is False
+    assert state["diagnostics"]["llm"]["selected_image_count"] == 1
 
 
 class DocumentProfileRepository:
@@ -120,3 +126,4 @@ def test_multi_agent_rag_graph_routes_holistic_questions_to_document_profiles():
     assert state["route_scores"]["document_profile"] > state["route_scores"]["chunk_search"]
     assert "cross_document_signal" in state["route_rationale"]
     assert state["verified_evidence"][0].chunk_id == "profile:d1"
+    assert state["diagnostics"]["route"]["selected_route"] == "document_profile"

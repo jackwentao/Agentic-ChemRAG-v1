@@ -26,10 +26,14 @@ class FakeGraph:
             "verified_evidence": evidence,
             "answer": "Fig. 2 shows the PL spectrum of ZnO.",
             "selected_images": {"figure:img1": [evidence[0].images[0]]},
+            "total_latency_ms": 18.5,
             "retrieval_latency_ms": 12.0,
             "rerank_latency_ms": 2.5,
             "rerank_enabled": True,
             "answer_latency_ms": 3.0,
+            "diagnostics": {
+                "rerank": {"latency_ms": 2.5, "candidate_count": 8},
+            },
         }
 
 
@@ -84,6 +88,7 @@ def test_evaluate_cases_records_route_metrics_outputs_and_latencies():
     assert result["latency_retrieval_ms"] == 12.0
     assert result["latency_rerank_ms"] == 2.5
     assert result["rerank_enabled"] is True
+    assert result["diagnostics"]["rerank"]["candidate_count"] == 8
     assert "by_expected_route" in report["summary"]
 
 
