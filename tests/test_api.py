@@ -1,7 +1,7 @@
 from io import BytesIO
 
 from fastapi.testclient import TestClient
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 import pytest
 
 import backend.app.api.dependencies as dependencies
@@ -13,6 +13,7 @@ from backend.app.providers.embeddings import FakeEmbeddingProvider
 from backend.app.providers.llm import FakeLlmProvider
 from backend.app.routing.query_router import QueryRouter, RouterWarmupStatus
 from backend.app.schemas import DocumentUploadResponse
+from backend.app.services.readiness import ReadinessCheck, ReadinessReport
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +38,42 @@ def test_health_endpoint():
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_readiness_endpoint_reports_complete_question_answer_capability():
+    class FakeReadinessService:
+        def inspect(self):
+            return ReadinessReport(
+                status="ready",
+                complete_qa_online=True,
+                can_serve_degraded=True,
+                checks={"llm": ReadinessCheck(status="ready", required=True, detail="可用。")},
+            )
+
+    app.dependency_overrides[dependencies.get_readiness_service] = FakeReadinessService
+    response = TestClient(app).get("/api/ready")
+
+    assert response.status_code == 200
+    assert response.json()["complete_qa_online"] is True
+    assert response.json()["checks"]["llm"]["status"] == "ready"
+
+
+def test_readiness_endpoint_returns_503_for_degraded_question_answer_capability():
+    class FakeReadinessService:
+        def inspect(self):
+            return ReadinessReport(
+                status="degraded",
+                complete_qa_online=False,
+                can_serve_degraded=True,
+                checks={"llm": ReadinessCheck(status="failed", required=True, detail="探测失败：ConnectionError")},
+            )
+
+    app.dependency_overrides[dependencies.get_readiness_service] = FakeReadinessService
+    response = TestClient(app).get("/api/ready")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "degraded"
+    assert response.json()["can_serve_degraded"] is True
 
 
 def test_batch_upload_accepts_valid_pdfs_and_rejects_invalid_files():
@@ -177,17 +214,15 @@ def test_image_asset_streams_object_storage_content():
     assert response.headers["content-type"] == "image/png"
 
 
-def test_repository_dependency_reuses_single_instance(monkeypatch):
-    built_urls = []
+def test_repository_dependency_uses_fastapi_managed_instance():
+    repository = object()
+    app.state.repository = repository
+    request = Request({"type": "http", "app": app})
 
-    class FakeRepository:
-        def __init__(self, database_url: str):
-            built_urls.append(database_url)
-
-    monkeypatch.setattr(dependencies, "PgVectorRepository", FakeRepository)
-
-    assert dependencies.get_repository() is dependencies.get_repository()
-    assert built_urls == [dependencies.get_settings().database_url]
+    try:
+        assert dependencies.get_repository(request) is repository
+    finally:
+        del app.state.repository
 
 
 def test_chat_response_includes_selected_citation_images():
@@ -250,7 +285,43 @@ def test_chat_response_includes_selected_citation_images():
     }
     assert payload["diagnostics"]["route"]["selected_route"] == "chunk_search"
     assert payload["diagnostics"]["recall"]["candidate_count"] == 1
+    assert payload["limitations"] == []
+    assert payload["diagnostics"]["verifier"]["sufficient"] is True
+    assert payload["diagnostics"]["verifier"]["answerable"] is True
+    assert payload["diagnostics"]["verifier"]["verified_evidence_count"] == 1
+    assert payload["diagnostics"]["retrieval_round"] == 1
+    assert payload["diagnostics"]["max_retrieval_rounds"] == 1
+    assert payload["diagnostics"]["task"]["task_type"] == "simple_fact"
+    assert payload["diagnostics"]["stop_reason"] == "sufficient_evidence"
+    assert payload["diagnostics"]["retrieval_rounds"][0]["new_evidence_count"] == 1
+    assert payload["diagnostics"]["assessment_rounds"][0]["sufficient"] is True
+    assert payload["diagnostics"]["llm_call_counts"] == {"evidence_assessment": 0, "answer_generation": 0}
     assert payload["diagnostics"]["llm"]["proxy_hit"] is True
+
+
+def test_chat_response_exposes_evidence_limitations():
+    class FakeRepository:
+        pass
+
+    class LimitedGraph:
+        def invoke(self, question, document_ids=None, scope=None):
+            return {
+                "answer": "检索到的证据不足以可靠回答该问题。",
+                "verified_evidence": [],
+                "selected_images": {},
+                "limitations": ["资料缺口：高温水相稳定性"],
+                "warnings": ["检索证据不足以回答问题。"],
+            }
+
+    app.dependency_overrides[dependencies.get_repository] = FakeRepository
+    app.dependency_overrides[dependencies.get_rag_graph] = LimitedGraph
+    response = TestClient(app).post(
+        "/api/chat",
+        json={"question": "高温水相中稳定吗？", "scope": "current_document", "document_ids": ["doc1"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["limitations"] == ["资料缺口：高温水相稳定性"]
 
 
 def test_startup_warmup_uses_cached_query_router(monkeypatch):
@@ -306,3 +377,26 @@ def test_startup_reranker_warmup_failure_does_not_block_startup(monkeypatch):
     monkeypatch.setattr(main_module, "get_reranker_provider", lambda: FakeReranker())
 
     main_module.warmup_reranker_on_startup()
+
+
+def test_lifespan_prepares_database_and_manages_repository(monkeypatch):
+    events = []
+
+    class FakeEngine:
+        def dispose(self):
+            events.append("dispose")
+
+    fake_engine = FakeEngine()
+
+    monkeypatch.setattr(main_module, "build_database_engine", lambda database_url: fake_engine)
+    monkeypatch.setattr(main_module, "prepare_database", lambda engine: events.append(("prepare", engine)))
+    monkeypatch.setattr(main_module, "warmup_router_on_startup", lambda: None)
+    monkeypatch.setattr(main_module, "warmup_reranker_on_startup", lambda: None)
+
+    with TestClient(app):
+        assert isinstance(app.state.repository, main_module.PgVectorRepository)
+        assert app.state.repository.engine is fake_engine
+        assert events == [("prepare", fake_engine)]
+
+    assert not hasattr(app.state, "repository")
+    assert events == [("prepare", fake_engine), "dispose"]

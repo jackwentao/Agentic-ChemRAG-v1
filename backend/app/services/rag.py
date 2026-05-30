@@ -1,4 +1,5 @@
 from dataclasses import replace
+import logging
 import re
 from time import perf_counter
 
@@ -14,6 +15,9 @@ from backend.app.observability.diagnostics import (
 )
 from backend.app.providers.embeddings import EmbeddingProvider
 from backend.app.providers.rerankers import RerankCandidate, RerankerProvider
+
+
+logger = logging.getLogger(__name__)
 
 
 class RetrievalService:
@@ -39,12 +43,25 @@ class RetrievalService:
         self.last_recall_diagnostics: dict[str, object] = {}
         self.last_rerank_diagnostics: dict[str, object] = build_rerank_diagnostics(enabled=self.reranker_enabled)
 
-    def retrieve(self, question: str, top_k: int = 5, document_ids: list[str] | None = None):
+    def retrieve(
+        self,
+        question: str,
+        top_k: int = 5,
+        document_ids: list[str] | None = None,
+        exclude_keys: set[tuple[str, str]] | None = None,
+    ):
+        # 文本块召回主入口：
+        # 1. 先做 query embedding
+        # 2. 从 repository 取候选
+        # 3. 视配置决定是否 rerank
+        # 4. 顺手记录一份可观测性诊断信息，供 API 层透出
         self._reset_rerank_state()
         if not hasattr(self.repository, "search"):
             raise TypeError("Repository must implement search.")
         if getattr(self.repository, "expects_text_query", False):
-            evidence = self.repository.search(question, self.embedding_provider, top_k)
+            # 某些测试仓储或规则仓储不吃向量，而是直接消费原始文本查询。
+            raw_evidence = self.repository.search(question, self.embedding_provider, top_k)
+            evidence, excluded_count = _exclude_existing(raw_evidence, exclude_keys)
             top_score, avg_score = score_summary(evidence)
             self.last_recall_diagnostics = build_recall_diagnostics(
                 mode="chunk",
@@ -56,6 +73,15 @@ class RetrievalService:
                 top_score=top_score,
                 avg_score=avg_score,
             )
+            self.last_rerank_diagnostics = build_rerank_diagnostics(
+                enabled=False,
+                candidate_count=len(evidence),
+                returned_count=len(evidence),
+                new_candidate_count=len(evidence),
+                excluded_existing_count=excluded_count,
+                incremental_only=bool(exclude_keys),
+                skip_reason="no_reranker",
+            )
             return evidence
         started_at = perf_counter()
         embedding_started_at = perf_counter()
@@ -63,80 +89,157 @@ class RetrievalService:
         embedding_latency_ms = (perf_counter() - embedding_started_at) * 1000
         candidate_k = max(top_k, self.reranker_chunk_candidates) if self.reranker_enabled else top_k
         search_started_at = perf_counter()
-        evidence = self.repository.search(query_embedding, candidate_k, document_ids=document_ids)
+        raw_evidence = self.repository.search(query_embedding, candidate_k, document_ids=document_ids)
         search_latency_ms = (perf_counter() - search_started_at) * 1000
-        selected = self._rerank_evidence(question, evidence, top_k, mode="chunk") if self.reranker_enabled else evidence[:top_k]
-        top_score, avg_score = score_summary(evidence)
+        evidence, excluded_count = _exclude_existing(raw_evidence, exclude_keys)
+        selected = (
+            self._rerank_evidence(question, evidence, top_k, mode="chunk", excluded_count=excluded_count, incremental_only=bool(exclude_keys))
+            if self.reranker_enabled
+            else evidence[:top_k]
+        )
+        if not self.reranker_enabled:
+            self.last_rerank_diagnostics = build_rerank_diagnostics(
+                enabled=False,
+                candidate_count=len(evidence),
+                returned_count=len(selected),
+                new_candidate_count=len(evidence),
+                excluded_existing_count=excluded_count,
+                incremental_only=bool(exclude_keys),
+                skip_reason="disabled",
+            )
+        top_score, avg_score = score_summary(raw_evidence)
         self.last_recall_diagnostics = build_recall_diagnostics(
             mode="chunk",
             latency_ms=(perf_counter() - started_at) * 1000,
             embedding_latency_ms=embedding_latency_ms,
             search_latency_ms=search_latency_ms,
-            candidate_count=len(evidence),
+            candidate_count=len(raw_evidence),
             returned_count=len(selected),
             top_score=top_score,
             avg_score=avg_score,
         )
         return selected
 
-    def retrieve_figures(self, question: str, top_k: int = 8, document_ids: list[str] | None = None):
+    def retrieve_figures(
+        self,
+        question: str,
+        top_k: int = 8,
+        document_ids: list[str] | None = None,
+        exclude_keys: set[tuple[str, str]] | None = None,
+    ):
+        # figure 检索与 chunk 检索共用同一套服务接口，
+        # 但在 repository 层拆出 search_figures，便于后续替换为专门的图像索引。
         self._reset_rerank_state()
         if not hasattr(self.repository, "search_figures"):
-            return self.retrieve(question, top_k=top_k, document_ids=document_ids)
+            return self.retrieve(question, top_k=top_k, document_ids=document_ids, exclude_keys=exclude_keys)
         started_at = perf_counter()
         embedding_started_at = perf_counter()
         query_embedding = self.embedding_provider.embed_query(question)
         embedding_latency_ms = (perf_counter() - embedding_started_at) * 1000
         candidate_k = max(top_k, self.reranker_figure_candidates) if self.reranker_enabled else top_k
         search_started_at = perf_counter()
-        evidence = self.repository.search_figures(query_embedding, candidate_k, document_ids=document_ids)
+        raw_evidence = self.repository.search_figures(query_embedding, candidate_k, document_ids=document_ids)
         search_latency_ms = (perf_counter() - search_started_at) * 1000
-        selected = self._rerank_evidence(question, evidence, top_k, mode="figure") if self.reranker_enabled else evidence[:top_k]
-        top_score, avg_score = score_summary(evidence)
+        evidence, excluded_count = _exclude_existing(raw_evidence, exclude_keys)
+        selected = (
+            self._rerank_evidence(question, evidence, top_k, mode="figure", excluded_count=excluded_count, incremental_only=bool(exclude_keys))
+            if self.reranker_enabled
+            else evidence[:top_k]
+        )
+        if not self.reranker_enabled:
+            self.last_rerank_diagnostics = build_rerank_diagnostics(
+                enabled=False,
+                candidate_count=len(evidence),
+                returned_count=len(selected),
+                new_candidate_count=len(evidence),
+                excluded_existing_count=excluded_count,
+                incremental_only=bool(exclude_keys),
+                skip_reason="disabled",
+            )
+        top_score, avg_score = score_summary(raw_evidence)
         self.last_recall_diagnostics = build_recall_diagnostics(
             mode="figure",
             latency_ms=(perf_counter() - started_at) * 1000,
             embedding_latency_ms=embedding_latency_ms,
             search_latency_ms=search_latency_ms,
-            candidate_count=len(evidence),
+            candidate_count=len(raw_evidence),
             returned_count=len(selected),
             top_score=top_score,
             avg_score=avg_score,
         )
         return selected
 
-    def retrieve_document_profiles(self, question: str, top_k: int = 5, document_ids: list[str] | None = None):
+    def retrieve_document_profiles(
+        self,
+        question: str,
+        top_k: int = 5,
+        document_ids: list[str] | None = None,
+        exclude_keys: set[tuple[str, str]] | None = None,
+    ):
+        # 文档画像检索更偏“论文级概览”，因此这里暂不做 rerank，
+        # 避免把原本就较短的画像描述再做额外改写和排序干预。
         self._reset_rerank_state()
         if not hasattr(self.repository, "search_document_profiles"):
-            return self.retrieve(question, top_k=top_k, document_ids=document_ids)
+            return self.retrieve(question, top_k=top_k, document_ids=document_ids, exclude_keys=exclude_keys)
         started_at = perf_counter()
         embedding_started_at = perf_counter()
         query_embedding = self.embedding_provider.embed_query(question)
         embedding_latency_ms = (perf_counter() - embedding_started_at) * 1000
         search_started_at = perf_counter()
-        evidence = self.repository.search_document_profiles(query_embedding, top_k, document_ids=document_ids)
+        raw_evidence = self.repository.search_document_profiles(query_embedding, top_k, document_ids=document_ids)
         search_latency_ms = (perf_counter() - search_started_at) * 1000
-        top_score, avg_score = score_summary(evidence)
+        evidence, excluded_count = _exclude_existing(raw_evidence, exclude_keys)
+        self.last_rerank_diagnostics = build_rerank_diagnostics(
+            enabled=self.reranker_enabled,
+            candidate_count=len(evidence),
+            returned_count=0,
+            new_candidate_count=len(evidence),
+            excluded_existing_count=excluded_count,
+            incremental_only=bool(exclude_keys),
+            skip_reason="document_profile_not_reranked",
+        )
+        top_score, avg_score = score_summary(raw_evidence)
         self.last_recall_diagnostics = build_recall_diagnostics(
             mode="document_profile",
             latency_ms=(perf_counter() - started_at) * 1000,
             embedding_latency_ms=embedding_latency_ms,
             search_latency_ms=search_latency_ms,
-            candidate_count=len(evidence),
+            candidate_count=len(raw_evidence),
             returned_count=len(evidence),
             top_score=top_score,
             avg_score=avg_score,
         )
         return evidence
 
-    def _rerank_evidence(self, question: str, evidence: list[Evidence], top_k: int, mode: str) -> list[Evidence]:
+    def _rerank_evidence(
+        self,
+        question: str,
+        evidence: list[Evidence],
+        top_k: int,
+        mode: str,
+        excluded_count: int = 0,
+        incremental_only: bool = False,
+    ) -> list[Evidence]:
+        # 重排阶段只关心候选集合内部相对顺序，不改变召回总入口的抽象。
         if not evidence or self.reranker_provider is None:
+            self.last_rerank_diagnostics = build_rerank_diagnostics(
+                enabled=False,
+                candidate_count=len(evidence),
+                returned_count=min(len(evidence), top_k),
+                new_candidate_count=len(evidence),
+                excluded_existing_count=excluded_count,
+                incremental_only=incremental_only,
+                skip_reason="no_new_candidates" if incremental_only and not evidence else "no_reranker",
+            )
             return evidence[:top_k]
         if len(evidence) < self.reranker_min_candidates:
             self.last_rerank_diagnostics = build_rerank_diagnostics(
                 enabled=False,
                 candidate_count=len(evidence),
                 returned_count=min(len(evidence), top_k),
+                new_candidate_count=len(evidence),
+                excluded_existing_count=excluded_count,
+                incremental_only=incremental_only,
                 skip_reason="insufficient_candidates",
             )
             return evidence[:top_k]
@@ -149,7 +252,28 @@ class RetrievalService:
         ]
         candidate_build_latency_ms = (perf_counter() - candidate_build_started_at) * 1000
         inference_started_at = perf_counter()
-        reranked = self.reranker_provider.rerank(question, candidates, top_k=len(candidates))
+        try:
+            reranked = self.reranker_provider.rerank(question, candidates, top_k=len(candidates))
+        except Exception:
+            self.last_rerank_latency_ms = (perf_counter() - started_at) * 1000
+            inference_latency_ms = (perf_counter() - inference_started_at) * 1000
+            total_chars, avg_chars = candidate_char_stats(candidate_texts)
+            self.last_rerank_diagnostics = build_rerank_diagnostics(
+                enabled=False,
+                latency_ms=self.last_rerank_latency_ms,
+                candidate_build_latency_ms=candidate_build_latency_ms,
+                inference_latency_ms=inference_latency_ms,
+                candidate_count=len(candidates),
+                returned_count=min(len(evidence), top_k),
+                input_char_count=total_chars,
+                avg_candidate_chars=avg_chars,
+                new_candidate_count=len(candidates),
+                excluded_existing_count=excluded_count,
+                incremental_only=incremental_only,
+                skip_reason="provider_error",
+            )
+            logger.exception("重排器调用失败，回退为向量召回结果。")
+            return evidence[:top_k]
         inference_latency_ms = (perf_counter() - inference_started_at) * 1000
         by_index = {str(index): item for index, item in enumerate(evidence)}
         postprocess_started_at = perf_counter()
@@ -159,6 +283,7 @@ class RetrievalService:
             if item is None:
                 continue
             original_index = int(result.candidate_id)
+            # 在通用 rerank 分数之外叠加少量业务启发式，专门改善 figure 问题的排序质量。
             adjusted_score = result.score + _metadata_adjustment(question, item, mode) - rank * 0.0001
             scored.append((adjusted_score, original_index, item))
         scored.sort(key=lambda row: (-row[0], row[1]))
@@ -192,6 +317,9 @@ class RetrievalService:
             changed_top_k=top_k_changed(evidence[:top_k], selected),
             top1_term_overlap_before=top1_before,
             top1_term_overlap_after=top1_after,
+            new_candidate_count=len(candidates),
+            excluded_existing_count=excluded_count,
+            incremental_only=incremental_only,
         )
         return selected
 
@@ -203,6 +331,8 @@ class RetrievalService:
 
 
 def _metadata_adjustment(question: str, item: Evidence, mode: str) -> float:
+    # 图像类检索往往依赖 caption、label、邻近文本等结构化元数据，
+    # 因此这里对 figure 模式做一层轻量加权，补足纯文本 rerank 的盲区。
     if mode != "figure" or not item.images:
         return 0.0
     image = item.images[0]
@@ -220,6 +350,17 @@ def _metadata_adjustment(question: str, item: Evidence, mode: str) -> float:
     if _term_overlap(question, label_caption) > 0:
         adjustment += min(1.5, 0.4 * _term_overlap(question, label_caption))
     return adjustment
+
+
+def _exclude_existing(
+    evidence: list[Evidence],
+    exclude_keys: set[tuple[str, str]] | None,
+) -> tuple[list[Evidence], int]:
+    # 多轮检索时要排除历史已经见过的 chunk，避免系统陷入“反复召回同一证据”的空转。
+    if not exclude_keys:
+        return evidence, 0
+    selected = [item for item in evidence if (item.document_id, item.chunk_id) not in exclude_keys]
+    return selected, len(evidence) - len(selected)
 
 
 def _has_alias_match(query: str, text: str) -> bool:

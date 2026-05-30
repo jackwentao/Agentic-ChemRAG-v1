@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.app.agents.rag_graph import MultiAgentRagGraph
 from backend.app.config import get_settings
+from backend.app.database import build_database_engine
 from backend.app.parsing.chunker import ParentChildChunker
 from backend.app.parsing.parser import PyMuPDFParser
 from backend.app.providers.embeddings import build_embedding_provider
@@ -28,7 +29,7 @@ def main() -> None:
 
     settings = get_settings()
     document_id = uuid4().hex
-    repository = PgVectorRepository(settings.database_url)
+    repository = PgVectorRepository(build_database_engine(settings.database_url))
     embedding_provider = build_embedding_provider(settings)
 
     ingestion = IngestionService(

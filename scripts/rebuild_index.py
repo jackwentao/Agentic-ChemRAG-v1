@@ -2,9 +2,10 @@ import argparse
 from hashlib import sha256
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from backend.app.config import get_settings
+from backend.app.database import build_database_engine
 from backend.app.parsing.chunker import ParentChildChunker
 from backend.app.parsing.parser import PyMuPDFParser
 from backend.app.providers.embeddings import build_embedding_provider
@@ -17,8 +18,8 @@ from backend.app.services.object_storage import build_object_storage
 def main() -> None:
     args = _parse_args()
     settings = get_settings()
-    engine = create_engine(settings.database_url, pool_pre_ping=True)
-    repository = PgVectorRepository(settings.database_url)
+    engine = build_database_engine(settings.database_url)
+    repository = PgVectorRepository(engine)
 
     documents = _list_documents(engine, resume=args.resume)
     print(f"Found {len(documents)} documents to rebuild.", flush=True)

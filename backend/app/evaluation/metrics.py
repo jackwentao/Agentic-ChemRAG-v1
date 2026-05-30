@@ -31,7 +31,15 @@ def evaluate_case_metrics(
     citations: list[dict[str, Any]],
     selected_images: list[dict[str, Any]],
     top_k: int,
+    limitations: list[str] | None = None,
+    retrieval_round: int = 0,
+    stop_reason: str | None = None,
+    assessment_rounds: list[dict[str, Any]] | None = None,
+    llm_call_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
+    limitations = limitations or []
+    assessment_rounds = assessment_rounds or []
+    llm_call_counts = llm_call_counts or {}
     metrics: dict[str, Any] = {
         "route_hit": actual_route == case.expected_route,
         "target_type": case.target_type,
@@ -59,8 +67,28 @@ def evaluate_case_metrics(
     metrics["figure_hit_mode"] = figure_hit_mode
     metrics["source_url_valid"] = source_urls_valid(citations, selected_images)
     metrics["answer_term_coverage"] = answer_term_coverage(answer, case.expected_answer_terms)
-    metrics["unsupported_claim_risk"] = bool(answer.strip()) and not citations and case.target_type != "none"
+    metrics["unsupported_claim_risk"] = (
+        bool(answer.strip())
+        and not citations
+        and case.target_type != "none"
+        and not _contains_refusal_marker(answer)
+    )
     metrics["refusal_correct"] = refusal_correct(answer, case.target_type)
+    metrics["aspect_coverage_rate"] = answer_term_coverage(answer, case.expected_aspects)
+    metrics["limitation_disclosure_hit"] = limitation_disclosure_hit(limitations, case.required_disclosures)
+    metrics["retrieval_round_count"] = int(retrieval_round)
+    metrics["first_round_success"] = retrieval_round == 1 and stop_reason == "sufficient_evidence"
+    metrics["retry_triggered"] = retrieval_round > 1
+    metrics["observed_retry_success"] = retrieval_round > 1 and stop_reason == "sufficient_evidence"
+    metrics["wasted_retry"] = retrieval_round > 1 and stop_reason != "sufficient_evidence"
+    metrics["max_rounds_exhausted"] = stop_reason == "max_rounds_reached"
+    metrics["no_new_evidence_stop"] = stop_reason == "no_new_evidence"
+    metrics["no_new_query_stop"] = stop_reason == "no_new_query"
+    metrics["retrieval_behavior_hit"] = retrieval_behavior_hit(case, retrieval_round, stop_reason)
+    metrics["assessment_round_count"] = len(assessment_rounds)
+    metrics["assessment_llm_calls"] = int(llm_call_counts.get("evidence_assessment", 0))
+    metrics["answer_llm_calls"] = int(llm_call_counts.get("answer_generation", 0))
+    metrics["total_tracked_llm_calls"] = metrics["assessment_llm_calls"] + metrics["answer_llm_calls"]
     return metrics
 
 
@@ -126,13 +154,46 @@ def answer_term_coverage(answer: str, expected_terms: list[str]) -> float:
 def refusal_correct(answer: str, target_type: str) -> bool:
     if target_type != "none":
         return True
+    return _contains_refusal_marker(answer)
+
+
+def _contains_refusal_marker(answer: str) -> bool:
     normalized = answer.lower()
     return any(marker.lower() in normalized for marker in REFUSAL_MARKERS)
 
 
+def limitation_disclosure_hit(limitations: list[str], required_disclosures: list[str]) -> bool:
+    if not required_disclosures:
+        return True
+    text = "\n".join(limitations).lower()
+    return all(disclosure.lower() in text for disclosure in required_disclosures)
+
+
+def retrieval_behavior_hit(case: GoldenCase, retrieval_round: int, stop_reason: str | None) -> bool:
+    if retrieval_round <= 0 or retrieval_round > case.max_acceptable_rounds:
+        return False
+    if case.expected_retrieval_behavior == "single_round_expected":
+        return retrieval_round == 1 and stop_reason == "sufficient_evidence"
+    if case.expected_retrieval_behavior == "insufficient_should_stop":
+        return stop_reason in {
+            "max_rounds_reached",
+            "no_new_query",
+            "no_new_evidence",
+            "assessment_fallback",
+            "no_search_direction",
+        }
+    return stop_reason == "sufficient_evidence"
+
+
 def summarize_latencies(results: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
     summary: dict[str, dict[str, float]] = {}
-    for key in ["latency_total_ms", "latency_retrieval_ms", "latency_rerank_ms", "latency_answer_ms"]:
+    for key in [
+        "latency_total_ms",
+        "latency_retrieval_ms",
+        "latency_assessment_ms",
+        "latency_rerank_ms",
+        "latency_answer_ms",
+    ]:
         values = [float(result.get(key, 0.0)) for result in results]
         summary[key] = _latency_stats(values)
     return summary

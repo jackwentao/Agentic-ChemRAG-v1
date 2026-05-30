@@ -171,7 +171,7 @@ class QueryRouter:
                 "图片",
                 "谱图",
             ],
-        )
+        ) or _has_chinese_figure_listing_signal(normalized)
         figure_label = bool(
             re.search(
                 r"\b(?:fig(?:ure)?|scheme|table)\.?\s*\d+[a-z]?|\b(?:fig(?:ure)?|scheme|table)s?\b|[图表]\s*\d+",
@@ -180,11 +180,52 @@ class QueryRouter:
         )
         visual_intent = _has_any(
             normalized,
-            ["show", "shown", "list", "which", "what", "describe", "contain", "包含", "列出", "展示", "显示"],
+            [
+                "show",
+                "shown",
+                "list",
+                "which",
+                "what",
+                "describe",
+                "contain",
+                "包含",
+                "列出",
+                "列举",
+                "展示",
+                "显示",
+                "查看",
+                "看一下",
+                "给我看",
+                "哪些",
+                "有什么",
+                "有哪",
+            ],
         )
         visual_terms = _has_any(
             normalized,
-            ["spectrum", "spectra", "pl", "xrd", "ftir", "uv-vis", "transmittance", "plot", "chart", "image", "图", "谱"],
+            [
+                "spectrum",
+                "spectra",
+                "pl",
+                "xrd",
+                "ftir",
+                "uv-vis",
+                "transmittance",
+                "sem",
+                "tem",
+                "plot",
+                "chart",
+                "image",
+                "图",
+                "谱",
+                "曲线",
+                "图像",
+                "显微",
+            ],
+        )
+        figure_local_fact = figure_label and _has_any(
+            normalized,
+            ["说明", "表明", "代表", "结果", "含义", "结论", "机制", "峰位", "数值", "多少", "为什么", "如何", "怎么", "是否", "支撑", "证明"],
         )
 
         if explicit_figure:
@@ -199,31 +240,52 @@ class QueryRouter:
         if visual_terms and visual_intent:
             scores["figure_index"] += 0.38
             rationale.append("visual_term_with_query_intent")
+        if figure_local_fact:
+            scores["chunk_search"] += 0.65
+            rationale.append("figure_local_fact_question")
 
-        summary_signal = _has_any(
+        strong_summary_signal = _has_any(
             normalized,
             [
                 "what is this paper about",
                 "what is the paper about",
-                "summarize",
-                "summary",
                 "main contribution",
                 "main idea",
                 "overview",
                 "这篇论文讲什么",
                 "该论文讲什么",
                 "这个论文讲什么",
+                "这篇文献讲什么",
+                "该文献讲什么",
                 "这篇论文主要研究什么",
+                "这篇文献主要研究什么",
+                "该论文主要研究什么",
+                "该文献主要研究什么",
                 "主要研究什么",
-                "总结",
-                "概述",
             ],
+        )
+        generic_summary_signal = _has_any(
+            normalized,
+            ["summarize", "summary", "总结", "概述", "概括", "梳理"],
+        )
+        whole_document_target = _has_any(normalized, ["paper", "document", "论文", "文献", "文章", "全文", "整篇"])
+        summary_signal = strong_summary_signal or (
+            generic_summary_signal
+            and whole_document_target
+            and not explicit_figure
+            and not figure_label
+            and not figure_local_fact
         )
         cross_doc_signal = bool(
             re.search(r"\bwhich\s+(?:papers|documents)\b|\bpapers?\s+(?:related to|discuss|about)\b", normalized)
+            or re.search(r"(?:哪些|哪几篇|找出|筛选|检索).{0,16}(?:论文|文献|文章)", normalized)
+            or (
+                context.scope == "all_documents"
+                and re.search(r"(?:论文|文献|文章).{0,16}(?:相关|有关|讨论|研究|涉及)", normalized)
+            )
         ) or _has_any(
             normalized,
-            ["哪些论文", "哪些文献", "相关论文", "相关文献"],
+            ["哪些论文", "哪些文献", "哪几篇论文", "哪几篇文献", "相关论文", "相关文献"],
         )
         profile_entity_signal = _has_any(normalized, ["porphyrin", "phthalocyanine", "卟啉", "酞菁"])
         all_docs_topic_signal = context.scope == "all_documents" and _has_any(
@@ -269,6 +331,7 @@ class QueryRouter:
                 "条件",
                 "方法",
                 "结果",
+                "结论",
                 "是什么",
             ],
         )
@@ -483,6 +546,16 @@ def _normalize(text: str) -> str:
 
 def _has_any(text: str, phrases: list[str]) -> bool:
     return any(phrase.lower() in text for phrase in phrases)
+
+
+def _has_chinese_figure_listing_signal(text: str) -> bool:
+    # 中文图表问题常用“有哪些/给我看/列出 + 图/谱图/曲线”的松散表达，
+    # 单靠固定短语容易漏召回；但这里仍限定输出对象必须是图像类资产。
+    figure_object = r"(?:图表|图片|图像|谱图|曲线|性能图|显微图|sem图|tem图|xrd图|ftir图|uv-vis图|pl图|图)"
+    return bool(
+        re.search(rf"(?:哪些|有哪(?:些)?|有什么|列出|列举|展示|显示|查看|看一下|给我看).{{0,16}}{figure_object}", text)
+        or re.search(rf"{figure_object}.{{0,12}}(?:有哪些|有哪(?:些)?|是什么|列表|清单)", text)
+    )
 
 
 def _is_multi_step(normalized: str) -> bool:

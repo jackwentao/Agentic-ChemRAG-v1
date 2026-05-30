@@ -7,12 +7,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.app.api.dependencies import get_query_router, get_reranker_provider
 from backend.app.api.routers import assets, chat, documents, maintenance
 from backend.app.config import get_settings
+from backend.app.database import build_database_engine, prepare_database
+from backend.app.repositories.conversation import PgConversationRepository
+from backend.app.repositories.postgres import PgVectorRepository
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
 def warmup_router_on_startup() -> None:
+    # 路由器预热用于提前加载分类/向量化依赖，避免首个请求承担冷启动延迟。
     if not settings.router_warmup_on_startup:
         return
     try:
@@ -23,6 +27,7 @@ def warmup_router_on_startup() -> None:
 
 
 def warmup_reranker_on_startup() -> None:
+    # 重排器通常比召回更重，是否预热交由配置控制，避免阻塞轻量部署场景。
     if not settings.reranker_enabled or not settings.reranker_warmup_on_startup:
         return
     try:
@@ -36,13 +41,27 @@ def warmup_reranker_on_startup() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    warmup_router_on_startup()
-    warmup_reranker_on_startup()
-    yield
+    # 将数据库初始化、Repository 装配和模型预热放到统一生命周期里，
+    # 这样 API 层只关心依赖注入，不直接承担基础设施编排逻辑。
+    engine = build_database_engine(settings.database_url)
+    try:
+        prepare_database(engine)
+        app.state.repository = PgVectorRepository(engine)
+        app.state.conversation_repository = PgConversationRepository(engine)
+        warmup_router_on_startup()
+        warmup_reranker_on_startup()
+        yield
+    finally:
+        if hasattr(app.state, "repository"):
+            del app.state.repository
+        if hasattr(app.state, "conversation_repository"):
+            del app.state.conversation_repository
+        engine.dispose()
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
+# 这里使用最宽松的 CORS 配置，便于本地前后端联调；如果走生产部署，建议收紧来源名单。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

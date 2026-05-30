@@ -1,5 +1,5 @@
 from backend.app.domain.documents import StoredImage
-from backend.app.repositories import postgres as postgres_module
+from backend.app.database import prepare_database
 from backend.app.repositories.postgres import PgVectorRepository
 
 
@@ -52,11 +52,10 @@ class FakeEngine:
         return FakeConnection(self)
 
 
-def test_pgvector_repository_schema_adds_image_metadata_columns(monkeypatch):
+def test_prepare_database_adds_image_metadata_columns():
     engine = FakeEngine()
-    monkeypatch.setattr(postgres_module, "create_engine", lambda database_url, pool_pre_ping=True: engine)
 
-    PgVectorRepository("postgresql://example")
+    prepare_database(engine)
 
     statements = "\n".join(sql for sql, _params in engine.calls)
     assert "ALTER TABLE images ADD COLUMN IF NOT EXISTS caption TEXT" in statements
@@ -65,11 +64,9 @@ def test_pgvector_repository_schema_adds_image_metadata_columns(monkeypatch):
     assert "CREATE TABLE IF NOT EXISTS document_profiles" in statements
 
 
-def test_pgvector_repository_add_images_persists_caption_metadata(monkeypatch):
+def test_pgvector_repository_add_images_persists_caption_metadata():
     engine = FakeEngine()
-    monkeypatch.setattr(postgres_module, "create_engine", lambda database_url, pool_pre_ping=True: engine)
-    repository = PgVectorRepository("postgresql://example")
-    engine.calls.clear()
+    repository = PgVectorRepository(engine)
 
     repository.add_images(
         [
@@ -96,7 +93,7 @@ def test_pgvector_repository_add_images_persists_caption_metadata(monkeypatch):
     assert params["source_type"] == "page_crop"
 
 
-def test_pgvector_repository_search_returns_image_caption_metadata(monkeypatch):
+def test_pgvector_repository_search_returns_image_caption_metadata():
     engine = FakeEngine()
     engine.search_rows = [
         {
@@ -121,8 +118,7 @@ def test_pgvector_repository_search_returns_image_caption_metadata(monkeypatch):
             ],
         }
     ]
-    monkeypatch.setattr(postgres_module, "create_engine", lambda database_url, pool_pre_ping=True: engine)
-    repository = PgVectorRepository("postgresql://example")
+    repository = PgVectorRepository(engine)
 
     evidence = repository.search([0.1, 0.2], top_k=1)
 
@@ -131,7 +127,7 @@ def test_pgvector_repository_search_returns_image_caption_metadata(monkeypatch):
     assert evidence[0].images[0].label == "Figure 1"
 
 
-def test_pgvector_repository_add_figures_and_search_returns_figure_evidence(monkeypatch):
+def test_pgvector_repository_add_figures_and_search_returns_figure_evidence():
     engine = FakeEngine()
     engine.figure_rows = [
         {
@@ -147,9 +143,7 @@ def test_pgvector_repository_add_figures_and_search_returns_figure_evidence(monk
             "score": 0.88,
         }
     ]
-    monkeypatch.setattr(postgres_module, "create_engine", lambda database_url, pool_pre_ping=True: engine)
-    repository = PgVectorRepository("postgresql://example")
-    engine.calls.clear()
+    repository = PgVectorRepository(engine)
 
     repository.add_figures(
         [

@@ -95,7 +95,25 @@ body {
   gap: 8px;
 }
 
-.document {
+.sessions {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 8px;
+  border-top: 1px solid #dde3ea;
+}
+
+.session-list {
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.document,
+.session {
   min-height: 70px;
   padding: 10px;
   text-align: left;
@@ -104,18 +122,21 @@ body {
 }
 
 .document.active,
+.session.active,
 .scope-tabs button.active {
   border-color: #1f6feb;
   box-shadow: 0 0 0 2px rgba(31, 111, 235, 0.12);
 }
 
-.document span {
+.document span,
+.session span {
   font-size: 14px;
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
 
 .document small,
+.session small,
 .empty {
   color: #70808d;
 }
@@ -177,8 +198,29 @@ body {
   overflow: auto;
 }
 
+.message {
+  display: grid;
+  gap: 10px;
+}
+
+.user-message {
+  max-width: min(720px, 86%);
+  justify-self: end;
+  border: 1px solid #b9d0f5;
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: #eef5ff;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.assistant-message {
+  max-width: 960px;
+}
+
 .answer,
 .placeholder,
+.limitations,
 .citation {
   background: #ffffff;
   border: 1px solid #dde3ea;
@@ -188,6 +230,19 @@ body {
 
 .placeholder {
   color: #70808d;
+}
+
+.limitations {
+  border-color: #f1d28a;
+  background: #fffaf0;
+  color: #6b5200;
+  font-size: 14px;
+}
+
+.limitations ul {
+  margin: 8px 0 0;
+  padding-left: 20px;
+  line-height: 1.55;
 }
 
 .notice {

@@ -31,6 +31,8 @@ def test_router_routes_explicit_figure_questions_to_figure_index():
     assert router.route("What figures or plots does this paper contain?").route == "figure_index"
     assert router.route("Which PL spectrum figures are shown?").route == "figure_index"
     assert router.route("该文献有什么性能图？").route == "figure_index"
+    assert router.route("这篇论文有哪些PL谱图？").route == "figure_index"
+    assert router.route("给我看一下这篇文献里的SEM图").route == "figure_index"
 
 
 def test_router_protects_fact_questions_from_weak_visual_terms():
@@ -38,10 +40,27 @@ def test_router_protects_fact_questions_from_weak_visual_terms():
 
     spectra = router.route("What nonlinear spectra topic is covered?")
     photoluminescence = router.route("What photoluminescence property is discussed?")
+    chinese_peak = router.route("PL谱峰位是多少？")
+    chinese_figure_result = router.route("总结图3说明了什么结果")
 
     assert spectra.route == "chunk_search"
     assert photoluminescence.route == "chunk_search"
     assert spectra.scores["chunk_search"] > spectra.scores["figure_index"]
+    assert chinese_peak.route == "chunk_search"
+    assert chinese_figure_result.route == "chunk_search"
+    assert "figure_local_fact_question" in chinese_figure_result.rationale
+
+
+def test_router_routes_chinese_document_profile_but_not_local_facts():
+    router = QueryRouter()
+
+    summary = router.route("帮我概括一下这篇文献", RouteContext(scope="current_document", document_ids=["doc1"]))
+    cross = router.route("找出和ZnO荧光相关的论文", RouteContext(scope="all_documents"))
+    solvent = router.route("这篇论文中溶剂相关的结果是什么？", RouteContext(scope="current_document", document_ids=["doc1"]))
+
+    assert summary.route == "document_profile"
+    assert cross.route == "document_profile"
+    assert solvent.route == "chunk_search"
 
 
 def test_router_flags_unrelated_low_confidence_questions():

@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     reranker_figure_candidates: int = Field(default=10, gt=0)
     reranker_min_candidates: int = Field(default=10, gt=0)
     reranker_warmup_on_startup: bool = True
+    conversation_recent_turns: int = Field(default=3, ge=0)
+    conversation_max_context_chars: int = Field(default=8000, gt=0)
+    conversation_user_excerpt_chars: int = Field(default=160, gt=0)
+    conversation_assistant_excerpt_chars: int = Field(default=240, gt=0)
+    conversation_citation_limit_per_turn: int = Field(default=3, ge=0)
+    conversation_limitation_limit_per_turn: int = Field(default=2, ge=0)
 
 
 @lru_cache
