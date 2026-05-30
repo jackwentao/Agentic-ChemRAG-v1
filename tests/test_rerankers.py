@@ -1,4 +1,6 @@
 import os
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -59,3 +61,26 @@ def test_online_reranker_clears_global_offline_flags(monkeypatch, tmp_path):
     assert "HF_HUB_OFFLINE" not in os.environ
     assert "TRANSFORMERS_OFFLINE" not in os.environ
     assert hub_constants.HF_HUB_OFFLINE is False
+
+
+def test_local_reranker_uses_huggingface_cache_without_transformer_cache_argument(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeCrossEncoder:
+        def __init__(self, model_name, **kwargs):
+            captured.update(kwargs)
+
+        def predict(self, pairs):
+            return [1.0 for _pair in pairs]
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", SimpleNamespace(CrossEncoder=FakeCrossEncoder))
+    provider = LocalBgeRerankerProvider(cache_dir=tmp_path, local_files_only=True)
+
+    provider.warmup()
+
+    assert "cache_folder" not in captured
+    assert "model_kwargs" not in captured
+    assert "processor_kwargs" not in captured
+    assert "config_kwargs" not in captured
+    assert os.environ["HUGGINGFACE_HUB_CACHE"] == str(tmp_path.resolve())
+    assert "SENTENCE_TRANSFORMERS_HOME" not in os.environ

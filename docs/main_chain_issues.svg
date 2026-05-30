@@ -1,0 +1,232 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1160" viewBox="0 0 1600 1160">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3 L0,6 Z" fill="#334155" />
+    </marker>
+    <marker id="warnArrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3 L0,6 Z" fill="#dc2626" />
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#0f172a" flood-opacity="0.12" />
+    </filter>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 34px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 18px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #475569; }
+      .lane-title { font: 700 18px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #334155; }
+      .node-title { font: 700 17px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #0f172a; }
+      .node-text { font: 400 14px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #475569; }
+      .small { font: 400 13px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #64748b; }
+      .issue-title { font: 700 15px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #7f1d1d; }
+      .issue-text { font: 400 13px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #7f1d1d; }
+      .warn-title { font: 700 15px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #78350f; }
+      .warn-text { font: 400 13px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #78350f; }
+      .ok-node { fill: #ffffff; stroke: #93c5fd; stroke-width: 2; filter: url(#shadow); }
+      .route-node { fill: #eff6ff; stroke: #60a5fa; stroke-width: 2; filter: url(#shadow); }
+      .risk-node { fill: #fff7ed; stroke: #fb923c; stroke-width: 2; filter: url(#shadow); }
+      .issue-node { fill: #fef2f2; stroke: #ef4444; stroke-width: 2; filter: url(#shadow); }
+      .gap-node { fill: #faf5ff; stroke: #c084fc; stroke-width: 2; filter: url(#shadow); }
+      .lane { fill: #ffffff; stroke: #e2e8f0; stroke-width: 1.5; }
+      .flow { stroke: #334155; stroke-width: 2.3; fill: none; marker-end: url(#arrow); }
+      .flow-soft { stroke: #94a3b8; stroke-width: 2; fill: none; marker-end: url(#arrow); stroke-dasharray: 6 6; }
+      .issue-link { stroke: #dc2626; stroke-width: 2; fill: none; marker-end: url(#warnArrow); stroke-dasharray: 5 5; }
+      .badge-p1 { fill: #dc2626; }
+      .badge-p2 { fill: #ea580c; }
+      .badge-p3 { fill: #7c3aed; }
+      .badge-text { font: 700 13px Arial, sans-serif; fill: #ffffff; }
+      .legend-title { font: 700 16px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #0f172a; }
+      .legend-text { font: 400 14px "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill: #475569; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1160" />
+  <text class="title" x="70" y="70">Agentic-ChemRAG 主链路问题地图</text>
+  <text class="subtitle" x="70" y="104">蓝色为当前可跑通主链路，红色/橙色为仍需补齐的问题点，紫色为横向工程化能力缺口。</text>
+
+  <rect class="lane" x="50" y="140" width="1500" height="170" rx="16" />
+  <text class="lane-title" x="72" y="174">A. 上传与索引链路</text>
+
+  <rect class="lane" x="50" y="340" width="1500" height="430" rx="16" />
+  <text class="lane-title" x="72" y="374">B. 问答主链路</text>
+
+  <rect class="lane" x="50" y="800" width="1500" height="210" rx="16" />
+  <text class="lane-title" x="72" y="834">C. 输出、可观测与工程化缺口</text>
+
+  <rect class="lane" x="50" y="1035" width="1500" height="80" rx="16" />
+
+  <!-- Upload/indexing chain -->
+  <rect class="ok-node" x="92" y="205" width="180" height="72" rx="12" />
+  <text class="node-title" x="118" y="232">PDF 上传</text>
+  <text class="node-text" x="118" y="255">DocumentService</text>
+
+  <rect class="ok-node" x="342" y="205" width="220" height="72" rx="12" />
+  <text class="node-title" x="368" y="232">对象存储 + 去重</text>
+  <text class="node-text" x="368" y="255">MinIO / file_hash</text>
+
+  <rect class="ok-node" x="632" y="205" width="220" height="72" rx="12" />
+  <text class="node-title" x="658" y="232">Celery 索引任务</text>
+  <text class="node-text" x="658" y="255">解析、图片、chunk</text>
+
+  <rect class="ok-node" x="922" y="205" width="220" height="72" rx="12" />
+  <text class="node-title" x="948" y="232">向量与画像入库</text>
+  <text class="node-text" x="948" y="255">chunks / figures / profiles</text>
+
+  <rect class="issue-node" x="1212" y="190" width="250" height="104" rx="12" />
+  <circle class="badge-p2" cx="1238" cy="216" r="15" />
+  <text class="badge-text" x="1229" y="221">P2</text>
+  <text class="warn-title" x="1262" y="215">用户隔离仍是 demo</text>
+  <text class="warn-text" x="1262" y="238">owner_id 硬编码为 demo</text>
+  <text class="warn-text" x="1262" y="258">真实多用户会有串库风险</text>
+
+  <path class="flow" d="M272 241 H342" />
+  <path class="flow" d="M562 241 H632" />
+  <path class="flow" d="M852 241 H922" />
+  <path class="issue-link" d="M1142 241 H1212" />
+
+  <!-- QA chain -->
+  <rect class="ok-node" x="92" y="420" width="190" height="86" rx="12" />
+  <text class="node-title" x="118" y="449">/api/chat</text>
+  <text class="node-text" x="118" y="472">解析 scope</text>
+  <text class="node-text" x="118" y="492">选择 document_ids</text>
+
+  <rect class="issue-node" x="92" y="548" width="252" height="112" rx="12" />
+  <circle class="badge-p1" cx="118" cy="575" r="15" />
+  <text class="badge-text" x="109" y="580">P1</text>
+  <text class="issue-title" x="142" y="574">会话链路未接入</text>
+  <text class="issue-text" x="142" y="598">session_id 未传入 graph</text>
+  <text class="issue-text" x="142" y="618">无近期消息和会话摘要</text>
+  <text class="issue-text" x="142" y="638">追问和指代消解不可靠</text>
+
+  <rect class="route-node" x="380" y="420" width="210" height="86" rx="12" />
+  <text class="node-title" x="406" y="449">Planner / Router</text>
+  <text class="node-text" x="406" y="472">chunk / figure / profile</text>
+  <text class="node-text" x="406" y="492">输出 route diagnostics</text>
+
+  <rect class="issue-node" x="380" y="548" width="270" height="112" rx="12" />
+  <circle class="badge-p1" cx="406" cy="575" r="15" />
+  <text class="badge-text" x="397" y="580">P1</text>
+  <text class="issue-title" x="430" y="574">低置信路由不会自纠错</text>
+  <text class="issue-text" x="430" y="598">needs_llm_router 只写诊断</text>
+  <text class="issue-text" x="430" y="618">没有真实升级路由节点</text>
+  <text class="issue-text" x="430" y="638">复杂问题可能沿错路执行</text>
+
+  <rect class="risk-node" x="700" y="420" width="220" height="86" rx="12" />
+  <text class="node-title" x="726" y="449">TaskClassifier</text>
+  <text class="node-text" x="726" y="472">任务类型 / 风险等级</text>
+  <text class="node-text" x="726" y="492">BudgetPolicy 控制轮次</text>
+
+  <rect class="issue-node" x="700" y="548" width="270" height="112" rx="12" />
+  <circle class="badge-p1" cx="726" cy="575" r="15" />
+  <text class="badge-text" x="717" y="580">P1</text>
+  <text class="issue-title" x="750" y="574">没有纯对话路径</text>
+  <text class="issue-text" x="750" y="598">requires_retrieval 恒为 true</text>
+  <text class="issue-text" x="750" y="618">总结上文/改写回答也会检索</text>
+  <text class="issue-text" x="750" y="638">Agentic 会话体验不完整</text>
+
+  <rect class="route-node" x="1030" y="420" width="220" height="86" rx="12" />
+  <text class="node-title" x="1056" y="449">Retriever</text>
+  <text class="node-text" x="1056" y="472">向量召回 + 可选重排</text>
+  <text class="node-text" x="1056" y="492">累积 evidence</text>
+
+  <rect class="risk-node" x="1310" y="420" width="190" height="86" rx="12" />
+  <text class="node-title" x="1336" y="449">EvidenceAssessor</text>
+  <text class="node-text" x="1336" y="472">判断是否足够</text>
+  <text class="node-text" x="1336" y="492">给出缺口和下一轮目标</text>
+
+  <path class="flow" d="M282 463 H380" />
+  <path class="flow" d="M590 463 H700" />
+  <path class="flow" d="M920 463 H1030" />
+  <path class="flow" d="M1250 463 H1310" />
+  <path class="issue-link" d="M187 506 V548" />
+  <path class="issue-link" d="M485 506 V548" />
+  <path class="issue-link" d="M810 506 V548" />
+
+  <rect class="route-node" x="1030" y="650" width="220" height="78" rx="12" />
+  <text class="node-title" x="1056" y="680">Controller / Refiner</text>
+  <text class="node-text" x="1056" y="703">最多 1-3 轮补充检索</text>
+
+  <rect class="issue-node" x="1310" y="568" width="220" height="114" rx="12" />
+  <circle class="badge-p2" cx="1336" cy="595" r="15" />
+  <text class="badge-text" x="1327" y="600">P2</text>
+  <text class="warn-title" x="1360" y="594">评估器失败即保守拒答</text>
+  <text class="warn-text" x="1360" y="618">fallback_used 时清空 verified</text>
+  <text class="warn-text" x="1360" y="638">可能有候选证据但不输出</text>
+  <text class="warn-text" x="1360" y="658">需要区分服务失败和证据不足</text>
+
+  <path class="flow" d="M1405 506 V535 Q1405 560 1385 560 H1140 Q1120 560 1120 650" />
+  <path class="flow-soft" d="M1030 689 H995 Q970 689 970 620 V463 H1030" />
+  <path class="issue-link" d="M1405 506 V568" />
+
+  <!-- Generation/output chain -->
+  <rect class="ok-node" x="92" y="860" width="210" height="86" rx="12" />
+  <text class="node-title" x="118" y="889">Answerer</text>
+  <text class="node-text" x="118" y="912">仅消费 verified_evidence</text>
+  <text class="node-text" x="118" y="932">生成答案和引用基础</text>
+
+  <rect class="issue-node" x="360" y="844" width="270" height="120" rx="12" />
+  <circle class="badge-p1" cx="386" cy="872" r="15" />
+  <text class="badge-text" x="377" y="877">P1</text>
+  <text class="issue-title" x="410" y="871">答案核验节点缺失</text>
+  <text class="issue-text" x="410" y="895">AnswerVerification 只是预留契约</text>
+  <text class="issue-text" x="410" y="915">高风险答案无独立 claim check</text>
+  <text class="issue-text" x="410" y="935">没有受控修订路径</text>
+
+  <rect class="risk-node" x="690" y="860" width="210" height="86" rx="12" />
+  <text class="node-title" x="716" y="889">ImageSelector</text>
+  <text class="node-text" x="716" y="912">选择关联图片</text>
+  <text class="node-text" x="716" y="932">figure 路径直接取图</text>
+
+  <rect class="issue-node" x="960" y="844" width="270" height="120" rx="12" />
+  <circle class="badge-p2" cx="986" cy="872" r="15" />
+  <text class="badge-text" x="977" y="877">P2</text>
+  <text class="warn-title" x="1010" y="871">图像/画像轻路径不够轻</text>
+  <text class="warn-text" x="1010" y="895">仍统一经过 EvidenceAssessor</text>
+  <text class="warn-text" x="1010" y="915">简单列图也可能触发 LLM 评估</text>
+  <text class="warn-text" x="1010" y="935">成本、延迟和失败面偏大</text>
+
+  <rect class="gap-node" x="1290" y="844" width="210" height="120" rx="12" />
+  <circle class="badge-p3" cx="1316" cy="872" r="15" />
+  <text class="badge-text" x="1307" y="877">P3</text>
+  <text class="node-title" x="1340" y="871">前端诊断展示不足</text>
+  <text class="node-text" x="1340" y="895">只展示 limitations</text>
+  <text class="node-text" x="1340" y="915">warnings / diagnostics 未呈现</text>
+  <text class="node-text" x="1340" y="935">排障和验收信息不透明</text>
+
+  <path class="flow" d="M1500 463 H1530 Q1550 463 1550 760 Q1550 903 1500 903" />
+  <path class="flow" d="M302 903 H360" />
+  <path class="flow" d="M630 903 H690" />
+  <path class="flow" d="M900 903 H960" />
+  <path class="flow" d="M1230 903 H1290" />
+
+  <!-- Cross-cutting gap strip -->
+  <rect class="gap-node" x="92" y="700" width="370" height="48" rx="10" />
+  <text class="node-title" x="118" y="731">缺少会话状态存储接口和状态更新节点</text>
+
+  <rect class="gap-node" x="520" y="700" width="390" height="48" rx="10" />
+  <text class="node-title" x="546" y="731">缺少路由升级 / 问题改写 / 范围澄清策略</text>
+
+  <rect class="gap-node" x="92" y="970" width="430" height="48" rx="10" />
+  <text class="node-title" x="118" y="1001">真实验收仍需端到端 smoke: 上传 -> 索引 -> 问答 -> 引用</text>
+
+  <rect class="gap-node" x="570" y="970" width="430" height="48" rx="10" />
+  <text class="node-title" x="596" y="1001">评测集需要覆盖追问、高风险、图像查询和资料不足场景</text>
+
+  <rect class="gap-node" x="1048" y="970" width="430" height="48" rx="10" />
+  <text class="node-title" x="1074" y="1001">需要把 diagnostics 做成 UI 和报告中的一等输出</text>
+
+  <!-- Legend -->
+  <circle class="badge-p1" cx="90" cy="1078" r="16" />
+  <text class="badge-text" x="81" y="1083">P1</text>
+  <text class="legend-title" x="116" y="1083">主链路能力缺口</text>
+  <text class="legend-text" x="260" y="1083">会影响 Agentic 问答是否成立，建议优先补齐。</text>
+
+  <circle class="badge-p2" cx="680" cy="1078" r="16" />
+  <text class="badge-text" x="671" y="1083">P2</text>
+  <text class="legend-title" x="706" y="1083">可靠性和成本风险</text>
+  <text class="legend-text" x="870" y="1083">当前可运行，但在真实使用中容易造成延迟、拒答或隔离问题。</text>
+
+  <circle class="badge-p3" cx="1220" cy="1078" r="16" />
+  <text class="badge-text" x="1211" y="1083">P3</text>
+  <text class="legend-title" x="1246" y="1083">可观测与验收增强</text>
+  <text class="legend-text" x="1410" y="1083">帮助定位和持续评估。</text>
+</svg>

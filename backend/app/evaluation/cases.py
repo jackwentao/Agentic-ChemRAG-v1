@@ -8,11 +8,33 @@ Route = Literal["chunk_search", "figure_index", "document_profile"]
 TargetType = Literal["document", "page", "figure", "mixed", "none"]
 AnswerType = Literal["fact_qa", "figure_query", "document_summary", "cross_document_filter", "refusal"]
 Scope = Literal["current_document", "all_documents"]
+TaskCategory = Literal[
+    "simple_fact",
+    "figure_or_summary",
+    "multi_condition",
+    "comparison",
+    "context_followup",
+    "high_risk",
+    "insufficient_evidence",
+]
+RiskLevel = Literal["low", "medium", "high"]
+RetrievalBehavior = Literal["single_round_expected", "retry_if_missing", "insufficient_should_stop"]
 
 ROUTES = {"chunk_search", "figure_index", "document_profile"}
 TARGET_TYPES = {"document", "page", "figure", "mixed", "none"}
 ANSWER_TYPES = {"fact_qa", "figure_query", "document_summary", "cross_document_filter", "refusal"}
 SCOPES = {"current_document", "all_documents"}
+TASK_CATEGORIES = {
+    "simple_fact",
+    "figure_or_summary",
+    "multi_condition",
+    "comparison",
+    "context_followup",
+    "high_risk",
+    "insufficient_evidence",
+}
+RISK_LEVELS = {"low", "medium", "high"}
+RETRIEVAL_BEHAVIORS = {"single_round_expected", "retry_if_missing", "insufficient_should_stop"}
 
 
 @dataclass(frozen=True)
@@ -29,6 +51,12 @@ class GoldenCase:
     expected_answer_terms: list[str] = field(default_factory=list)
     answer_type: AnswerType = "fact_qa"
     notes: str | None = None
+    task_category: TaskCategory = "simple_fact"
+    risk_level: RiskLevel = "low"
+    expected_aspects: list[str] = field(default_factory=list)
+    required_disclosures: list[str] = field(default_factory=list)
+    expected_retrieval_behavior: RetrievalBehavior = "single_round_expected"
+    max_acceptable_rounds: int = 1
 
 
 def load_golden_cases(path: Path) -> list[GoldenCase]:
@@ -79,6 +107,24 @@ def parse_golden_case(payload: dict[str, Any], source: str = "<case>") -> Golden
     notes = payload["notes"]
     if notes is not None and not isinstance(notes, str):
         raise ValueError(f"{source}: notes must be a string or null")
+    default_category = _default_task_category(answer_type)
+    task_category = _enum(payload.get("task_category", default_category), TASK_CATEGORIES, "task_category", source)
+    risk_level = _enum(payload.get("risk_level", "low"), RISK_LEVELS, "risk_level", source)
+    expected_aspects = _string_list(payload.get("expected_aspects", []), "expected_aspects", source)
+    required_disclosures = _string_list(payload.get("required_disclosures", []), "required_disclosures", source)
+    default_behavior = "insufficient_should_stop" if answer_type == "refusal" else "single_round_expected"
+    expected_retrieval_behavior = _enum(
+        payload.get("expected_retrieval_behavior", default_behavior),
+        RETRIEVAL_BEHAVIORS,
+        "expected_retrieval_behavior",
+        source,
+    )
+    default_rounds = 3 if expected_retrieval_behavior != "single_round_expected" else 1
+    max_acceptable_rounds = _positive_int(
+        payload.get("max_acceptable_rounds", default_rounds),
+        "max_acceptable_rounds",
+        source,
+    )
 
     return GoldenCase(
         case_id=case_id,
@@ -93,6 +139,12 @@ def parse_golden_case(payload: dict[str, Any], source: str = "<case>") -> Golden
         expected_answer_terms=expected_answer_terms,
         answer_type=answer_type,  # type: ignore[arg-type]
         notes=notes,
+        task_category=task_category,  # type: ignore[arg-type]
+        risk_level=risk_level,  # type: ignore[arg-type]
+        expected_aspects=expected_aspects,
+        required_disclosures=required_disclosures,
+        expected_retrieval_behavior=expected_retrieval_behavior,  # type: ignore[arg-type]
+        max_acceptable_rounds=max_acceptable_rounds,
     )
 
 
@@ -118,6 +170,22 @@ def _int_list(value: Any, field_name: str, source: str) -> list[int]:
     if not isinstance(value, list) or not all(isinstance(item, int) and item > 0 for item in value):
         raise ValueError(f"{source}: {field_name} must be a list of positive integers")
     return value
+
+
+def _positive_int(value: Any, field_name: str, source: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{source}: {field_name} must be a positive integer")
+    return value
+
+
+def _default_task_category(answer_type: str) -> str:
+    if answer_type == "refusal":
+        return "insufficient_evidence"
+    if answer_type in {"figure_query", "document_summary"}:
+        return "figure_or_summary"
+    if answer_type == "cross_document_filter":
+        return "multi_condition"
+    return "simple_fact"
 
 
 def _figure_list(value: Any, source: str) -> list[dict[str, Any] | str]:

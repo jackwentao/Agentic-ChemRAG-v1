@@ -42,18 +42,21 @@ class LocalBgeM3EmbeddingProvider(EmbeddingProvider):
                         self.cache_dir.mkdir(parents=True, exist_ok=True)
                         cache_value = str(self.cache_dir.resolve())
                         os.environ.setdefault("HF_HOME", cache_value)
-                        os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str((self.cache_dir / "hub").resolve()))
-                        os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", str((self.cache_dir / "sentence-transformers").resolve()))
+                        os.environ["HUGGINGFACE_HUB_CACHE"] = cache_value
+                        os.environ.pop("SENTENCE_TRANSFORMERS_HOME", None)
                     if self.local_files_only:
                         os.environ.setdefault("HF_HUB_OFFLINE", "1")
                         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
                     from sentence_transformers import SentenceTransformer
 
+                    cache_dir = str(self.cache_dir.resolve()) if self.cache_dir else None
                     self._model = SentenceTransformer(
                         self.model_name,
                         device=self.device,
-                        cache_folder=str(self.cache_dir) if self.cache_dir else None,
                         local_files_only=self.local_files_only,
+                        model_kwargs={"cache_dir": cache_dir} if cache_dir else None,
+                        processor_kwargs={"cache_dir": cache_dir} if cache_dir else None,
+                        config_kwargs={"cache_dir": cache_dir} if cache_dir else None,
                     )
         return self._model
 

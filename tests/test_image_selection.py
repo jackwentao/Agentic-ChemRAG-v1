@@ -77,6 +77,16 @@ class FakeClient:
         self.chat = type("Chat", (), {"completions": FakeChatCompletions()})()
 
 
+class FailingChatCompletions:
+    def create(self, model, messages, response_format=None):
+        raise ConnectionError("Connection error.")
+
+
+class FailingClient:
+    def __init__(self) -> None:
+        self.chat = type("Chat", (), {"completions": FailingChatCompletions()})()
+
+
 def test_deepseek_image_selector_prompt_includes_caption_and_nearby_text():
     provider = DeepSeekLlmProvider.__new__(DeepSeekLlmProvider)
     provider.model = "test-model"
@@ -126,6 +136,28 @@ def test_fallback_selected_images_uses_figure_references_when_llm_selects_none()
 
     assert selected["c1"][0].image_id == "img1"
     assert selected["c1"][0].reason == "Selected from candidate images linked to figure-related evidence."
+
+
+def test_deepseek_image_selector_falls_back_when_service_connection_is_unavailable():
+    provider = DeepSeekLlmProvider.__new__(DeepSeekLlmProvider)
+    provider.model = "test-model"
+    provider.client = FailingClient()
+    evidence = [
+        Evidence(
+            chunk_id="c1",
+            document_id="doc1",
+            text="Figure 3. Photoluminescence spectra show green emission.",
+            page_start=2,
+            page_end=3,
+            section_title="Results",
+            score=0.9,
+            images=[EvidenceImage(image_id="img1", page=2, width=640, height=480)],
+        )
+    ]
+
+    selected = provider.select_images_for_answer("What do the PL spectra show?", "Figure 3 shows green emission.", evidence)
+
+    assert selected["c1"][0].image_id == "img1"
 
 
 def test_fallback_selected_images_stays_empty_without_visual_signal():

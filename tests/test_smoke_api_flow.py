@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from scripts.smoke_api_flow import run_smoke_flow
+import scripts.smoke_api_flow as smoke_api_flow
 
 
 class FakeResponse:
@@ -43,7 +43,7 @@ def test_smoke_flow_uploads_waits_for_indexing_and_asks_question(tmp_path: Path)
     pdf_path.write_bytes(b"%PDF fake")
     client = FakeClient()
 
-    result = run_smoke_flow(client, pdf_path, "论文结论是什么？", sleep=lambda _: None)
+    result = smoke_api_flow.run_smoke_flow(client, pdf_path, "论文结论是什么？", sleep=lambda _: None)
 
     assert result["document"]["chunk_count"] == 4
     assert result["chat"]["answer"] == "有依据的回答"
@@ -53,3 +53,23 @@ def test_smoke_flow_uploads_waits_for_indexing_and_asks_question(tmp_path: Path)
         "scope": "current_document",
         "document_ids": ["doc1"],
     }
+
+
+def test_smoke_script_configures_utf8_console_output(monkeypatch):
+    class RecordingStream:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def reconfigure(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+
+    stdout = RecordingStream()
+    stderr = RecordingStream()
+    monkeypatch.setattr(smoke_api_flow.sys, "stdout", stdout)
+    monkeypatch.setattr(smoke_api_flow.sys, "stderr", stderr)
+
+    smoke_api_flow.configure_console_output()
+
+    expected = [{"encoding": "utf-8", "errors": "replace"}]
+    assert stdout.calls == expected
+    assert stderr.calls == expected

@@ -78,6 +78,51 @@ def prepare_database(engine: Engine) -> None:
         conn.execute(
             text(
                 """
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL DEFAULT 'demo',
+                    title TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    message_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    scope TEXT,
+                    document_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    citations_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    images_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    limitations_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    diagnostics_summary_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS chat_contexts (
+                    session_id TEXT PRIMARY KEY REFERENCES chat_sessions(session_id) ON DELETE CASCADE,
+                    recent_context TEXT NOT NULL DEFAULT '',
+                    compressed_context TEXT NOT NULL DEFAULT '',
+                    context_char_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
                 CREATE UNIQUE INDEX IF NOT EXISTS documents_owner_file_hash_idx
                 ON documents (owner_id, file_hash)
                 WHERE file_hash IS NOT NULL
@@ -101,6 +146,8 @@ def prepare_database(engine: Engine) -> None:
             )
         )
         conn.execute(text("CREATE INDEX IF NOT EXISTS figures_document_page_idx ON figures (document_id, page)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS chat_sessions_owner_updated_idx ON chat_sessions (owner_id, updated_at DESC)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS chat_messages_session_created_idx ON chat_messages (session_id, created_at ASC)"))
         conn.execute(
             text(
                 """

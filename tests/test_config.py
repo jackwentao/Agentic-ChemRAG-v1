@@ -27,3 +27,11 @@ def test_windows_setup_starts_minio_with_other_dependencies():
     script_text = Path("scripts/setup_windows.ps1").read_text(encoding="utf-8")
 
     assert "docker compose up -d postgres redis minio" in script_text
+
+
+def test_windows_scripts_use_warning_free_huggingface_cache_root():
+    for script_path in ("scripts/setup_windows.ps1", "scripts/start_api.ps1", "scripts/start_worker.ps1"):
+        script_text = Path(script_path).read_text(encoding="utf-8")
+
+        assert '$env:HUGGINGFACE_HUB_CACHE = Join-Path $ProjectRoot "storage\\models"' in script_text
+        assert "Remove-Item Env:SENTENCE_TRANSFORMERS_HOME -ErrorAction SilentlyContinue" in script_text

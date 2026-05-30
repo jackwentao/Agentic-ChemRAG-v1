@@ -10,6 +10,10 @@ from backend.app.config import Settings
 
 class ObjectStorage(ABC):
     @abstractmethod
+    def healthcheck(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
     def put_bytes(self, key: str, data: bytes, content_type: str) -> None:
         raise NotImplementedError
 
@@ -31,6 +35,9 @@ class LocalObjectStorage(ObjectStorage):
         path = self._path_for(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+
+    def healthcheck(self) -> None:
+        self.root_dir.mkdir(parents=True, exist_ok=True)
 
     def open(self, key: str) -> BinaryIO:
         return self._path_for(key).open("rb")
@@ -65,6 +72,10 @@ class MinioObjectStorage(ObjectStorage):
         )
         if not self.client.bucket_exists(self.bucket):
             self.client.make_bucket(self.bucket)
+
+    def healthcheck(self) -> None:
+        if not self.client.bucket_exists(self.bucket):
+            raise RuntimeError(f"Object storage bucket is unavailable: {self.bucket}")
 
     def put_bytes(self, key: str, data: bytes, content_type: str) -> None:
         from io import BytesIO

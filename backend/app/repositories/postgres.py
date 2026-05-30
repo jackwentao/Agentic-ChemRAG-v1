@@ -10,6 +10,10 @@ class PgVectorRepository:
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
 
+    def healthcheck(self) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(text("SELECT 1"))
+
     def add_chunks(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
         with self.engine.begin() as conn:
             for chunk, embedding in zip(chunks, embeddings, strict=True):

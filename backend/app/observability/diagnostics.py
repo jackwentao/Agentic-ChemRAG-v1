@@ -74,6 +74,9 @@ def build_rerank_diagnostics(
     top1_term_overlap_before: int = 0,
     top1_term_overlap_after: int = 0,
     skip_reason: str | None = None,
+    new_candidate_count: int = 0,
+    excluded_existing_count: int = 0,
+    incremental_only: bool = False,
 ) -> dict[str, Any]:
     proxy_hit = returned_count > 0 and top1_term_overlap_after >= top1_term_overlap_before
     return {
@@ -91,6 +94,9 @@ def build_rerank_diagnostics(
         "top1_term_overlap_before": int(top1_term_overlap_before),
         "top1_term_overlap_after": int(top1_term_overlap_after),
         "skip_reason": skip_reason,
+        "new_candidate_count": int(new_candidate_count),
+        "excluded_existing_count": int(excluded_existing_count),
+        "incremental_only": bool(incremental_only),
         "proxy_hit": proxy_hit,
     }
 
@@ -114,6 +120,112 @@ def build_llm_diagnostics(
         "selected_image_count": int(selected_image_count),
         "proxy_hit": proxy_hit,
     }
+
+
+def build_verifier_diagnostics(
+    *,
+    latency_ms: float,
+    used_llm: bool,
+    sufficient: bool,
+    fallback_used: bool,
+    input_evidence_count: int,
+    verified_evidence_count: int,
+    covered_aspects: list[str],
+    missing_aspects: list[str],
+    conflicts: list[str],
+    next_search_goal: str | None,
+    confidence: float | None,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "latency_ms": float(latency_ms),
+        "used_llm": bool(used_llm),
+        "sufficient": bool(sufficient),
+        "answerable": bool(sufficient),
+        "fallback_used": bool(fallback_used),
+        "input_evidence_count": int(input_evidence_count),
+        "verified_evidence_count": int(verified_evidence_count),
+        "covered_aspects": list(covered_aspects),
+        "missing_aspects": list(missing_aspects),
+        "conflicts": list(conflicts),
+        "next_search_goal": next_search_goal,
+        "confidence": _maybe_float(confidence),
+        "reason": reason,
+        "proxy_hit": bool(sufficient and verified_evidence_count > 0),
+    }
+
+
+def build_retrieval_round_diagnostics(
+    *,
+    round_index: int,
+    query: str,
+    latency_ms: float,
+    candidate_count: int,
+    returned_count: int,
+    new_evidence_count: int,
+    accumulated_evidence_count: int,
+    rerank_new_candidate_count: int = 0,
+    rerank_excluded_existing_count: int = 0,
+    rerank_incremental_only: bool = False,
+) -> dict[str, Any]:
+    return {
+        "round_index": int(round_index),
+        "query": query,
+        "latency_ms": float(latency_ms),
+        "candidate_count": int(candidate_count),
+        "returned_count": int(returned_count),
+        "new_evidence_count": int(new_evidence_count),
+        "accumulated_evidence_count": int(accumulated_evidence_count),
+        "rerank_new_candidate_count": int(rerank_new_candidate_count),
+        "rerank_excluded_existing_count": int(rerank_excluded_existing_count),
+        "rerank_incremental_only": bool(rerank_incremental_only),
+    }
+
+
+def build_assessment_round_diagnostics(
+    *,
+    round_index: int,
+    latency_ms: float,
+    used_llm: bool,
+    sufficient: bool,
+    fallback_used: bool,
+    input_evidence_count: int,
+    verified_evidence_count: int,
+    covered_aspects: list[str],
+    missing_aspects: list[str],
+    conflicts: list[str],
+    next_search_goal: str | None,
+    confidence: float | None,
+) -> dict[str, Any]:
+    return {
+        "round_index": int(round_index),
+        "latency_ms": float(latency_ms),
+        "used_llm": bool(used_llm),
+        "sufficient": bool(sufficient),
+        "fallback_used": bool(fallback_used),
+        "input_evidence_count": int(input_evidence_count),
+        "verified_evidence_count": int(verified_evidence_count),
+        "covered_aspects": list(covered_aspects),
+        "missing_aspects": list(missing_aspects),
+        "conflicts": list(conflicts),
+        "next_search_goal": next_search_goal,
+        "confidence": _maybe_float(confidence),
+    }
+
+
+def increment_llm_call_count(
+    counts: dict[str, int] | None,
+    stage: str,
+    used_llm: bool,
+) -> dict[str, int]:
+    payload = {
+        "evidence_assessment": 0,
+        "answer_generation": 0,
+        **{key: int(value) for key, value in (counts or {}).items()},
+    }
+    if used_llm:
+        payload[stage] = payload.get(stage, 0) + 1
+    return payload
 
 
 def update_stage_proxy_hit(diagnostics: dict[str, Any] | None, stage: str, value: bool) -> dict[str, Any]:

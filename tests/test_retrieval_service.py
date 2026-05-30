@@ -4,6 +4,11 @@ from backend.app.providers.rerankers import FakeRerankerProvider
 from backend.app.services.rag import RetrievalService
 
 
+class FailingReranker:
+    def rerank(self, query, candidates, top_k):
+        raise RuntimeError("model unavailable")
+
+
 class VectorOnlyRepository:
     def __init__(self) -> None:
         self.received_vector = None
@@ -169,6 +174,8 @@ def test_document_profile_retrieval_does_not_call_reranker():
     assert service.last_recall_diagnostics["mode"] == "document_profile"
     assert service.last_rerank_diagnostics["enabled"] is True
     assert service.last_rerank_diagnostics["returned_count"] == 0
+    assert service.last_rerank_diagnostics["new_candidate_count"] == 1
+    assert service.last_rerank_diagnostics["skip_reason"] == "document_profile_not_reranked"
 
 
 def test_retrieve_skips_rerank_when_candidates_are_below_threshold():
@@ -189,3 +196,47 @@ def test_retrieve_skips_rerank_when_candidates_are_below_threshold():
     assert service.last_rerank_diagnostics["enabled"] is False
     assert service.last_rerank_diagnostics["skip_reason"] == "insufficient_candidates"
     assert service.last_rerank_diagnostics["candidate_count"] == 4
+
+
+def test_retrieve_falls_back_to_vector_results_when_reranker_fails():
+    repository = VectorOnlyRepository()
+    service = RetrievalService(
+        repository,
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_provider=FailingReranker(),
+        reranker_enabled=True,
+        reranker_chunk_candidates=10,
+        reranker_min_candidates=1,
+    )
+
+    results = service.retrieve("ZnO photoluminescence", top_k=3)
+
+    assert [item.chunk_id for item in results] == ["c0", "c1", "c2"]
+    assert service.last_rerank_enabled is False
+    assert service.last_rerank_diagnostics["enabled"] is False
+    assert service.last_rerank_diagnostics["skip_reason"] == "provider_error"
+    assert service.last_rerank_diagnostics["returned_count"] == 3
+
+
+def test_followup_retrieval_reranks_only_candidates_not_seen_in_previous_round():
+    repository = VectorOnlyRepository()
+    service = RetrievalService(
+        repository,
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_provider=FakeRerankerProvider(),
+        reranker_enabled=True,
+        reranker_chunk_candidates=10,
+        reranker_min_candidates=1,
+    )
+
+    results = service.retrieve(
+        "ZnO photoluminescence additional evidence",
+        top_k=3,
+        exclude_keys={("d1", "c0"), ("d1", "c1")},
+    )
+
+    assert [item.chunk_id for item in results] == ["c2", "c3"]
+    assert service.last_recall_diagnostics["candidate_count"] == 4
+    assert service.last_rerank_diagnostics["incremental_only"] is True
+    assert service.last_rerank_diagnostics["excluded_existing_count"] == 2
+    assert service.last_rerank_diagnostics["new_candidate_count"] == 2

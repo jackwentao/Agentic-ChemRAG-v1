@@ -1,9 +1,18 @@
 import argparse
 from pathlib import Path
+import sys
 import time
 from typing import Callable
 
 import httpx
+
+
+def configure_console_output() -> None:
+    """在 Windows 控制台中稳定输出模型生成的 Unicode 文本。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 def wait_for_indexing(
@@ -79,6 +88,7 @@ def run_smoke_flow(
 
 
 def main() -> None:
+    configure_console_output()
     parser = argparse.ArgumentParser(description="通过真实 API 验证 PDF 上传、异步索引与问答链路。")
     parser.add_argument("pdf", type=Path, help="用于验证的本地 PDF 文件路径。")
     parser.add_argument("--api-base", default="http://127.0.0.1:8000", help="API 服务地址。")

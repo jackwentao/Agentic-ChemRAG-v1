@@ -62,15 +62,48 @@ type DocumentSummary = {
 
 type ChatScope = "current_document" | "all_documents";
 
+type ChatSession = {
+  session_id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type ChatMessage = {
+  message_id: string;
+  session_id: string;
+  role: "user" | "assistant";
+  content: string;
+  scope: string | null;
+  document_ids: string[];
+  citations: Citation[];
+  images: CitationImage[];
+  limitations: string[];
+  diagnostics_summary?: Record<string, unknown>;
+  created_at: string | null;
+  status?: "sending" | "failed";
+};
+
+type ChatResponse = {
+  session_id: string;
+  answer: string;
+  citations: Citation[];
+  user_message: ChatMessage;
+  assistant_message: ChatMessage;
+  limitations: string[];
+  warnings: string[];
+};
+
 function App() {
   const [taskId, setTaskId] = useState("");
   const [documentId, setDocumentId] = useState("");
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [sessionId, setSessionId] = useState("");
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [scope, setScope] = useState<ChatScope>("current_document");
   const [task, setTask] = useState<Task | null>(null);
   const [question, setQuestion] = useState("");
-  const [answer, setAnswer] = useState("");
-  const [citations, setCitations] = useState<Citation[]>([]);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
 
@@ -79,10 +112,10 @@ function App() {
     [documents, documentId]
   );
   const selectedDocumentStatus = selectedDocument ? getDocumentStatus(selectedDocument) : "";
-  const selectedCitationImages = useMemo(() => collectCitationImages(citations), [citations]);
 
   useEffect(() => {
     void refreshDocuments();
+    void refreshSessions();
   }, []);
 
   async function refreshDocuments(preferredDocumentId?: string) {
@@ -97,6 +130,35 @@ function App() {
     const firstIndexed = data.find((document) => document.is_indexed);
     const next = preferred ?? current ?? firstIndexed ?? data[0];
     if (next) setDocumentId(next.document_id);
+  }
+
+  async function refreshSessions(preferredSessionId?: string, options: { loadMessages?: boolean } = {}) {
+    const response = await fetch(`${API_BASE}/api/chat/sessions`);
+    const data: { sessions: ChatSession[] } = await response.json();
+    setSessions(data.sessions);
+    const nextSessionId = preferredSessionId ?? sessionId ?? data.sessions[0]?.session_id ?? "";
+    if (nextSessionId) {
+      setSessionId(nextSessionId);
+      if (options.loadMessages !== false) {
+        await loadMessages(nextSessionId);
+      }
+    }
+  }
+
+  async function loadMessages(nextSessionId: string) {
+    const response = await fetch(`${API_BASE}/api/chat/sessions/${nextSessionId}/messages`);
+    if (!response.ok) {
+      setMessages([]);
+      return;
+    }
+    const data: { messages: ChatMessage[] } = await response.json();
+    setMessages(data.messages);
+  }
+
+  function startNewChat() {
+    setSessionId("");
+    setMessages([]);
+    setNotice("");
   }
 
   async function upload(files: FileList) {
@@ -167,6 +229,26 @@ function App() {
       return;
     }
 
+    const submittedQuestion = question;
+    const tempUserMessageId = localMessageId("user");
+    const requestDocumentIds = scope === "current_document" && documentId ? [documentId] : [];
+    setMessages((currentMessages) => [
+      ...currentMessages,
+      {
+        message_id: tempUserMessageId,
+        session_id: sessionId || `local-session-${tempUserMessageId}`,
+        role: "user",
+        content: submittedQuestion,
+        scope,
+        document_ids: requestDocumentIds,
+        citations: [],
+        images: [],
+        limitations: [],
+        diagnostics_summary: {},
+        created_at: new Date().toISOString(),
+        status: "sending"
+      }
+    ]);
     setBusy(true);
     setNotice("正在检索文献并生成回答...");
     const controller = new AbortController();
@@ -177,20 +259,30 @@ function App() {
         headers: { "Content-Type": "application/json" },
         signal: controller.signal,
         body: JSON.stringify({
-          question,
+          question: submittedQuestion,
+          session_id: sessionId || undefined,
           scope,
           document_ids: scope === "current_document" && documentId ? [documentId] : undefined
         })
       });
-      const data = await response.json();
+      const data: ChatResponse & { detail?: string } = await response.json();
       if (!response.ok) {
+        markMessageFailed(tempUserMessageId);
         setNotice(data.detail ?? "Question failed.");
         return;
       }
-      setAnswer(data.answer);
-      setCitations(data.citations ?? []);
+      setSessionId(data.session_id);
+      setQuestion("");
+      setMessages((currentMessages) => [
+        ...currentMessages.map((message) =>
+          message.message_id === tempUserMessageId ? data.user_message : message
+        ),
+        data.assistant_message
+      ]);
+      await refreshSessions(data.session_id, { loadMessages: false });
       setNotice("");
     } catch (error) {
+      markMessageFailed(tempUserMessageId);
       if (error instanceof DOMException && error.name === "AbortError") {
         setNotice("This question took too long. Try a narrower scope or ask about a specific figure, method, or result.");
       } else {
@@ -200,6 +292,14 @@ function App() {
       window.clearTimeout(timeoutId);
       setBusy(false);
     }
+  }
+
+  function markMessageFailed(messageId: string) {
+    setMessages((currentMessages) =>
+      currentMessages.map((message) =>
+        message.message_id === messageId ? { ...message, status: "failed" } : message
+      )
+    );
   }
 
   return (
@@ -242,6 +342,32 @@ function App() {
               ))}
             </div>
           )}
+
+          <section className="sessions">
+            <header>
+              <h2>Chats</h2>
+              <button onClick={startNewChat}>New</button>
+            </header>
+            {sessions.length === 0 ? (
+              <p className="empty">Ask a question to start a chat.</p>
+            ) : (
+              <div className="session-list">
+                {sessions.map((session) => (
+                  <button
+                    className={session.session_id === sessionId ? "session active" : "session"}
+                    key={session.session_id}
+                    onClick={() => {
+                      setSessionId(session.session_id);
+                      void loadMessages(session.session_id);
+                    }}
+                  >
+                    <span>{session.title}</span>
+                    <small>{formatSessionTime(session.updated_at)}</small>
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
         </aside>
 
         <section className="chat">
@@ -257,52 +383,11 @@ function App() {
           )}
           {notice && <div className="notice">{notice}</div>}
           <div className="messages">
-            {answer ? <article className="answer">{answer}</article> : <article className="placeholder">Ask a question after indexing a paper.</article>}
-            {selectedCitationImages.length > 0 && (
-              <div className="answer-images">
-                {selectedCitationImages.map((image) => (
-                  <a
-                    className="citation-image"
-                    href={`${API_BASE}${image.source_url}`}
-                    key={image.image_id}
-                    rel="noreferrer"
-                    target="_blank"
-                    title={imageTitle(image)}
-                  >
-                    <img alt={`Related figure from page ${image.page}`} src={`${API_BASE}${image.url}`} />
-                    <span>p. {image.page}</span>
-                  </a>
-                ))}
-              </div>
+            {messages.length === 0 ? (
+              <article className="placeholder">Ask a question after indexing a paper.</article>
+            ) : (
+              messages.map((message) => <ChatMessageView key={message.message_id} message={message} />)
             )}
-            {citations.map((citation) => (
-              <article className="citation" key={citation.chunk_id}>
-                <header>
-                  <a className="citation-source" href={`${API_BASE}${citation.source_url}`} rel="noreferrer" target="_blank">
-                    <strong>{citation.section_title}</strong>
-                    <span>p. {citation.page_start}-{citation.page_end}</span>
-                  </a>
-                </header>
-                <p>{citation.quote}</p>
-                {(citation.images ?? []).length > 0 && (
-                  <div className="citation-images">
-                    {(citation.images ?? []).map((image) => (
-                      <a
-                        className="citation-image"
-                        href={`${API_BASE}${image.source_url}`}
-                        key={image.image_id}
-                        rel="noreferrer"
-                        target="_blank"
-                        title={imageTitle(image)}
-                      >
-                        <img alt={`Related figure from page ${image.page}`} src={`${API_BASE}${image.url}`} />
-                        <span>p. {image.page}</span>
-                      </a>
-                    ))}
-                  </div>
-                )}
-              </article>
-            ))}
           </div>
           <div className="composer">
             <input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about mechanisms, methods, or results..." />
@@ -313,6 +398,71 @@ function App() {
         </section>
       </section>
     </main>
+  );
+}
+
+function ChatMessageView({ message }: { message: ChatMessage }) {
+  if (message.role === "user") {
+    return <article className="message user-message">{message.content}</article>;
+  }
+  const selectedCitationImages = collectCitationImages(message.citations ?? []);
+  return (
+    <article className="message assistant-message">
+      <div className="answer">{message.content}</div>
+      {message.limitations.length > 0 && (
+        <div className="limitations">
+          <strong>资料限制</strong>
+          <ul>
+            {message.limitations.map((limitation) => <li key={limitation}>{limitation}</li>)}
+          </ul>
+        </div>
+      )}
+      {selectedCitationImages.length > 0 && (
+        <div className="answer-images">
+          {selectedCitationImages.map((image) => (
+            <a
+              className="citation-image"
+              href={`${API_BASE}${image.source_url}`}
+              key={image.image_id}
+              rel="noreferrer"
+              target="_blank"
+              title={imageTitle(image)}
+            >
+              <img alt={`Related figure from page ${image.page}`} src={`${API_BASE}${image.url}`} />
+              <span>p. {image.page}</span>
+            </a>
+          ))}
+        </div>
+      )}
+      {message.citations.map((citation) => (
+        <article className="citation" key={citation.chunk_id}>
+          <header>
+            <a className="citation-source" href={`${API_BASE}${citation.source_url}`} rel="noreferrer" target="_blank">
+              <strong>{citation.section_title}</strong>
+              <span>p. {citation.page_start}-{citation.page_end}</span>
+            </a>
+          </header>
+          <p>{citation.quote}</p>
+          {(citation.images ?? []).length > 0 && (
+            <div className="citation-images">
+              {(citation.images ?? []).map((image) => (
+                <a
+                  className="citation-image"
+                  href={`${API_BASE}${image.source_url}`}
+                  key={image.image_id}
+                  rel="noreferrer"
+                  target="_blank"
+                  title={imageTitle(image)}
+                >
+                  <img alt={`Related figure from page ${image.page}`} src={`${API_BASE}${image.url}`} />
+                  <span>p. {image.page}</span>
+                </a>
+              ))}
+            </div>
+          )}
+        </article>
+      ))}
+    </article>
   );
 }
 
@@ -353,6 +503,16 @@ function collectCitationImages(citations: Citation[]) {
 function imageTitle(image: CitationImage) {
   const caption = [image.label, image.caption].filter(Boolean).join(" ");
   return caption || image.reason || `Image from page ${image.page}`;
+}
+
+function formatSessionTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function localMessageId(role: ChatMessage["role"]) {
+  return `local-${role}-${crypto.randomUUID()}`;
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

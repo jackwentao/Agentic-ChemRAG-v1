@@ -13,6 +13,7 @@ from backend.app.providers.embeddings import FakeEmbeddingProvider
 from backend.app.providers.llm import FakeLlmProvider
 from backend.app.routing.query_router import QueryRouter, RouterWarmupStatus
 from backend.app.schemas import DocumentUploadResponse
+from backend.app.services.readiness import ReadinessCheck, ReadinessReport
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +38,42 @@ def test_health_endpoint():
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_readiness_endpoint_reports_complete_question_answer_capability():
+    class FakeReadinessService:
+        def inspect(self):
+            return ReadinessReport(
+                status="ready",
+                complete_qa_online=True,
+                can_serve_degraded=True,
+                checks={"llm": ReadinessCheck(status="ready", required=True, detail="可用。")},
+            )
+
+    app.dependency_overrides[dependencies.get_readiness_service] = FakeReadinessService
+    response = TestClient(app).get("/api/ready")
+
+    assert response.status_code == 200
+    assert response.json()["complete_qa_online"] is True
+    assert response.json()["checks"]["llm"]["status"] == "ready"
+
+
+def test_readiness_endpoint_returns_503_for_degraded_question_answer_capability():
+    class FakeReadinessService:
+        def inspect(self):
+            return ReadinessReport(
+                status="degraded",
+                complete_qa_online=False,
+                can_serve_degraded=True,
+                checks={"llm": ReadinessCheck(status="failed", required=True, detail="探测失败：ConnectionError")},
+            )
+
+    app.dependency_overrides[dependencies.get_readiness_service] = FakeReadinessService
+    response = TestClient(app).get("/api/ready")
+
+    assert response.status_code == 503
+    assert response.json()["status"] == "degraded"
+    assert response.json()["can_serve_degraded"] is True
 
 
 def test_batch_upload_accepts_valid_pdfs_and_rejects_invalid_files():
@@ -248,7 +285,43 @@ def test_chat_response_includes_selected_citation_images():
     }
     assert payload["diagnostics"]["route"]["selected_route"] == "chunk_search"
     assert payload["diagnostics"]["recall"]["candidate_count"] == 1
+    assert payload["limitations"] == []
+    assert payload["diagnostics"]["verifier"]["sufficient"] is True
+    assert payload["diagnostics"]["verifier"]["answerable"] is True
+    assert payload["diagnostics"]["verifier"]["verified_evidence_count"] == 1
+    assert payload["diagnostics"]["retrieval_round"] == 1
+    assert payload["diagnostics"]["max_retrieval_rounds"] == 1
+    assert payload["diagnostics"]["task"]["task_type"] == "simple_fact"
+    assert payload["diagnostics"]["stop_reason"] == "sufficient_evidence"
+    assert payload["diagnostics"]["retrieval_rounds"][0]["new_evidence_count"] == 1
+    assert payload["diagnostics"]["assessment_rounds"][0]["sufficient"] is True
+    assert payload["diagnostics"]["llm_call_counts"] == {"evidence_assessment": 0, "answer_generation": 0}
     assert payload["diagnostics"]["llm"]["proxy_hit"] is True
+
+
+def test_chat_response_exposes_evidence_limitations():
+    class FakeRepository:
+        pass
+
+    class LimitedGraph:
+        def invoke(self, question, document_ids=None, scope=None):
+            return {
+                "answer": "检索到的证据不足以可靠回答该问题。",
+                "verified_evidence": [],
+                "selected_images": {},
+                "limitations": ["资料缺口：高温水相稳定性"],
+                "warnings": ["检索证据不足以回答问题。"],
+            }
+
+    app.dependency_overrides[dependencies.get_repository] = FakeRepository
+    app.dependency_overrides[dependencies.get_rag_graph] = LimitedGraph
+    response = TestClient(app).post(
+        "/api/chat",
+        json={"question": "高温水相中稳定吗？", "scope": "current_document", "document_ids": ["doc1"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["limitations"] == ["资料缺口：高温水相稳定性"]
 
 
 def test_startup_warmup_uses_cached_query_router(monkeypatch):

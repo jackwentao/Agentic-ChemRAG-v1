@@ -16,6 +16,12 @@ def valid_payload():
         "expected_figures": [{"page": 2, "caption_terms": ["PL"]}],
         "expected_answer_terms": ["PL"],
         "answer_type": "figure_query",
+        "task_category": "figure_or_summary",
+        "risk_level": "low",
+        "expected_aspects": ["PL"],
+        "required_disclosures": [],
+        "expected_retrieval_behavior": "retry_if_missing",
+        "max_acceptable_rounds": 2,
         "notes": None,
     }
 
@@ -27,6 +33,9 @@ def test_parse_golden_case_accepts_required_schema():
     assert case.expected_route == "figure_index"
     assert case.target_type == "figure"
     assert case.expected_figures == [{"page": 2, "caption_terms": ["PL"]}]
+    assert case.task_category == "figure_or_summary"
+    assert case.expected_retrieval_behavior == "retry_if_missing"
+    assert case.max_acceptable_rounds == 2
 
 
 def test_parse_golden_case_requires_expected_route_and_target_type_enums():
@@ -62,4 +71,38 @@ def test_parse_golden_case_reports_missing_fields():
     del payload["expected_route"]
 
     with pytest.raises(ValueError, match="missing required fields"):
+        parse_golden_case(payload)
+
+
+def test_parse_golden_case_supplies_backward_compatible_evaluation_defaults():
+    payload = valid_payload()
+    for field in [
+        "task_category",
+        "risk_level",
+        "expected_aspects",
+        "required_disclosures",
+        "expected_retrieval_behavior",
+        "max_acceptable_rounds",
+    ]:
+        del payload[field]
+
+    case = parse_golden_case(payload)
+
+    assert case.task_category == "figure_or_summary"
+    assert case.risk_level == "low"
+    assert case.expected_retrieval_behavior == "single_round_expected"
+    assert case.max_acceptable_rounds == 1
+
+
+def test_parse_golden_case_rejects_invalid_cost_baseline_fields():
+    payload = valid_payload()
+    payload["risk_level"] = "critical"
+
+    with pytest.raises(ValueError, match="risk_level"):
+        parse_golden_case(payload)
+
+    payload = valid_payload()
+    payload["max_acceptable_rounds"] = 0
+
+    with pytest.raises(ValueError, match="max_acceptable_rounds"):
         parse_golden_case(payload)
