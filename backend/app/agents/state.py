@@ -55,6 +55,8 @@ class RagGraphState(TypedDict, total=False):
     answer: str
     limitations: list[str]
     answer_verification: AnswerVerification | None
+    answer_verification_latency_ms: float
+    answer_revision_count: int
     total_latency_ms: float
     retrieval_latency_ms: float
     rerank_latency_ms: float

@@ -4,9 +4,11 @@ from langgraph.graph import END, StateGraph
 
 from backend.app.agents.state import RagGraphState
 from backend.app.domain.documents import Evidence, EvidenceImage
-from backend.app.domain.rag import EvidenceAssessment, QueryPlan, RoutePlan, RouteStep
+from backend.app.domain.rag import AnswerVerification, EvidenceAssessment, QueryPlan, RoutePlan, RouteStep
 from backend.app.observability.diagnostics import (
+    build_answer_verification_diagnostics,
     build_assessment_round_diagnostics,
+    build_image_selection_diagnostics,
     build_llm_diagnostics,
     build_retrieval_round_diagnostics,
     build_route_diagnostics,
@@ -16,8 +18,21 @@ from backend.app.observability.diagnostics import (
     update_stage_proxy_hit,
 )
 from backend.app.providers.llm import LlmProvider
+from backend.app.retrieval.refinement import (
+    HybridQueryRefiner,
+    LlmQueryRefiner,
+    QueryRefinementPlan,
+    RetrievalStrategyDecision,
+    RetrievalStrategySelector,
+    RuleQueryRefiner,
+    build_retrieval_policy_context,
+    normalized_query,
+    refinement_diagnostics,
+)
 from backend.app.routing.query_router import QueryRouter, RouteContext
+from backend.app.routing.answer_verification import AnswerVerificationPolicy
 from backend.app.routing.task_policy import BudgetPolicy, TaskClassifier, assessment_requirements
+from backend.app.services.image_selection import ImageSelectionContext, ImageSelectionService
 from backend.app.services.rag import RetrievalService
 
 
@@ -32,6 +47,10 @@ class MultiAgentRagGraph:
         query_router: QueryRouter | None = None,
         task_classifier: TaskClassifier | None = None,
         budget_policy: BudgetPolicy | None = None,
+        answer_verification_policy: AnswerVerificationPolicy | None = None,
+        strategy_selector: RetrievalStrategySelector | None = None,
+        query_refiner: HybridQueryRefiner | None = None,
+        image_selection_service: ImageSelectionService | None = None,
     ) -> None:
         self.retrieval_service = retrieval_service
         self.llm_provider = llm_provider
@@ -41,6 +60,13 @@ class MultiAgentRagGraph:
         self.query_router = query_router or QueryRouter(getattr(retrieval_service, "embedding_provider", None))
         self.task_classifier = task_classifier or TaskClassifier()
         self.budget_policy = budget_policy or BudgetPolicy()
+        self.answer_verification_policy = answer_verification_policy or AnswerVerificationPolicy()
+        self.strategy_selector = strategy_selector or RetrievalStrategySelector()
+        self.image_selection_service = image_selection_service or ImageSelectionService(llm_provider)
+        self.query_refiner = query_refiner or HybridQueryRefiner(
+            RuleQueryRefiner(),
+            LlmQueryRefiner(llm_provider),
+        )
         self.graph = self._build().compile()
 
     def invoke(
@@ -84,9 +110,10 @@ class MultiAgentRagGraph:
                 "accumulated_evidence": [],
                 "retrieval_history": [],
                 "assessment_history": [],
-                "llm_call_counts": {"evidence_assessment": 0, "answer_generation": 0},
+                "llm_call_counts": {"evidence_assessment": 0, "answer_generation": 0, "image_selection": 0},
                 "limitations": [],
                 "warnings": [],
+                "answer_revision_count": 0,
             }
         )
         total_latency_ms = (perf_counter() - started_at) * 1000
@@ -111,6 +138,8 @@ class MultiAgentRagGraph:
         graph.add_node("query_refiner", self._query_refiner)
         graph.add_node("step_finalizer", self._step_finalizer)
         graph.add_node("answerer", self._answerer)
+        graph.add_node("answer_verifier", self._answer_verifier)
+        graph.add_node("answer_reviser", self._answer_reviser)
         graph.add_node("image_selector", self._image_selector)
         graph.add_edge("planner", "task_classifier")
         graph.add_edge("task_classifier", "budget_policy")
@@ -136,7 +165,13 @@ class MultiAgentRagGraph:
             self._next_after_step_finalizer,
             {"next_step": "task_classifier", "answer": "answerer"},
         )
-        graph.add_edge("answerer", "image_selector")
+        graph.add_edge("answerer", "answer_verifier")
+        graph.add_conditional_edges(
+            "answer_verifier",
+            self._next_after_answer_verifier,
+            {"revise": "answer_reviser", "images": "image_selector"},
+        )
+        graph.add_edge("answer_reviser", "image_selector")
         graph.add_edge("image_selector", END)
         graph.set_entry_point("planner")
         return graph
@@ -418,36 +453,57 @@ class MultiAgentRagGraph:
         return {**state, "max_retrieval_rounds": max_rounds, "diagnostics": diagnostics}
 
     def _query_refiner(self, state: RagGraphState) -> RagGraphState:
-        # query_refiner 用规则方式拼接下一轮查询词，优点是可解释、可测试、易替换。
+        # query_refiner 只负责补充检索策略，不改变当前路由节点给出的 route。
         assessment = state["evidence_assessment"]
-        next_query = _build_refined_query(
-            _build_contextual_question(state["original_question"], state.get("conversation_context")),
+        contextual_question = _build_contextual_question(state["original_question"], state.get("conversation_context"))
+        context = build_retrieval_policy_context(state)
+        decision = self.strategy_selector.select(context)
+        plan = self.query_refiner.refine(
+            contextual_question,
             assessment,
+            context,
+            decision,
+            state.get("task_decision"),
         )
         attempted_queries = {
-            _normalized_query(query)
+            normalized_query(query)
             for plan in state.get("query_plans", [])
             for query in plan.queries
         }
-        if not next_query or _normalized_query(next_query) in attempted_queries:
-            diagnostics = {**state.get("diagnostics", {}), "stop_reason": "no_new_query"}
+        next_query = _first_new_query(plan, attempted_queries)
+        diagnostics = {
+            **state.get("diagnostics", {}),
+            **refinement_diagnostics(context, decision, plan),
+        }
+        if decision.strategy == "stop":
+            diagnostics = {**diagnostics, "stop_reason": _stop_reason_from_strategy(decision)}
+            stopped = {
+                **state,
+                "continue_retrieval": False,
+                "stop_reason": _stop_reason_from_strategy(decision),
+                "diagnostics": diagnostics,
+            }
+            return {**stopped, "warnings": _final_warnings(stopped)}
+        if not next_query:
+            diagnostics = {**diagnostics, "stop_reason": "no_new_query"}
             stopped = {**state, "continue_retrieval": False, "stop_reason": "no_new_query", "diagnostics": diagnostics}
             return {**stopped, "warnings": _final_warnings(stopped)}
         round_index = state.get("retrieval_round", 1) + 1
-        plan = QueryPlan(
+        query_plan = QueryPlan(
             original_question=state["original_question"],
             resolved_question=next_query,
-            queries=[next_query],
-            search_goal=assessment.next_search_goal or "补充尚缺证据",
+            queries=plan.queries or [next_query],
+            search_goal=plan.search_goal or assessment.next_search_goal or "补充尚缺证据",
             round_index=round_index,
         )
         return {
             **state,
             "current_query": next_query,
             "retrieval_round": round_index,
-            "query_plans": [*state.get("query_plans", []), plan],
+            "query_plans": [*state.get("query_plans", []), query_plan],
             "continue_retrieval": True,
             "stop_reason": None,
+            "diagnostics": diagnostics,
         }
 
     def _step_finalizer(self, state: RagGraphState) -> RagGraphState:
@@ -671,20 +727,182 @@ class MultiAgentRagGraph:
             "diagnostics": diagnostics,
         }
 
-    def _image_selector(self, state: RagGraphState) -> RagGraphState:
-        # 图像选择与答案生成解耦，后续可以单独替换为更强的视觉相关性模型。
-        if state.get("route") == "figure_index":
-            selected = _select_first_figure_images(state.get("verified_evidence", []), max_images=3)
-            diagnostics = _with_selected_image_count(state.get("diagnostics"), selected)
-            return {**state, "selected_images": selected, "diagnostics": diagnostics}
-        selected = self.llm_provider.select_images_for_answer(
+    def _answer_verifier(self, state: RagGraphState) -> RagGraphState:
+        # 答案核验发生在生成之后，只检查答案是否忠实于 verified_evidence。
+        # 未触发时写入轻量诊断，便于评测区分“未核验”和“核验通过”。
+        started_at = perf_counter()
+        decision = self.answer_verification_policy.decide(
+            answer=state.get("answer", ""),
+            evidence=state.get("verified_evidence", []),
+            limitations=state.get("limitations", []),
+            task_decision=state.get("task_decision"),
+            evidence_assessment=state.get("evidence_assessment"),
+            route=state.get("route", "chunk_search"),
+            scope=state.get("scope") or ("current_document" if state.get("document_ids") else "all_documents"),
+            is_multi_step=bool(state.get("is_multi_step", False)),
+        )
+        if not decision.should_verify:
+            verification = AnswerVerification(
+                passed=True,
+                triggered=False,
+                reason="未满足答案级核验触发条件。",
+            )
+            latency_ms = (perf_counter() - started_at) * 1000
+            diagnostics = {
+                **state.get("diagnostics", {}),
+                "answer_verification": build_answer_verification_diagnostics(
+                    latency_ms=latency_ms,
+                    triggered=False,
+                    passed=True,
+                    trigger_reasons=[],
+                    unsupported_claims=[],
+                    missing_disclosures=[],
+                    citation_errors=[],
+                    overstatements=[],
+                    revision_instruction=None,
+                    used_llm=False,
+                    fallback_used=False,
+                    reason=verification.reason,
+                ),
+            }
+            return {**state, "answer_verification": verification, "diagnostics": diagnostics}
+
+        verification = self.llm_provider.verify_answer_with_evidence(
             _build_contextual_question(state["question"], state.get("conversation_context")),
             state.get("answer", ""),
             state.get("verified_evidence", []),
-            max_images=3,
+            limitations=state.get("limitations", []),
+            task_decision=state.get("task_decision"),
+            evidence_assessment=state.get("evidence_assessment"),
+            trigger_reasons=decision.reasons,
         )
-        diagnostics = _with_selected_image_count(state.get("diagnostics"), selected)
-        return {**state, "selected_images": selected, "diagnostics": diagnostics}
+        latency_ms = (perf_counter() - started_at) * 1000
+        llm_call_counts = increment_llm_call_count(
+            state.get("llm_call_counts"),
+            "answer_verification",
+            verification.used_llm,
+        )
+        diagnostics = {
+            **state.get("diagnostics", {}),
+            "llm_call_counts": llm_call_counts,
+            "answer_verification": build_answer_verification_diagnostics(
+                latency_ms=latency_ms,
+                triggered=verification.triggered,
+                passed=verification.passed,
+                trigger_reasons=verification.trigger_reasons,
+                unsupported_claims=verification.unsupported_claims,
+                missing_disclosures=verification.missing_disclosures,
+                citation_errors=verification.citation_errors,
+                overstatements=verification.overstatements,
+                revision_instruction=verification.revision_instruction,
+                used_llm=verification.used_llm,
+                fallback_used=verification.fallback_used,
+                reason=verification.reason,
+            ),
+        }
+        warnings = list(state.get("warnings", []))
+        if verification.triggered and not verification.passed:
+            warnings.append(f"答案核验未通过：{verification.reason or '存在未支撑断言或遗漏限制。'}")
+        return {
+            **state,
+            "answer_verification": verification,
+            "answer_verification_latency_ms": latency_ms,
+            "llm_call_counts": llm_call_counts,
+            "warnings": list(dict.fromkeys(warnings)),
+            "diagnostics": diagnostics,
+        }
+
+    def _next_after_answer_verifier(self, state: RagGraphState) -> str:
+        verification = state.get("answer_verification")
+        if (
+            isinstance(verification, AnswerVerification)
+            and verification.triggered
+            and not verification.passed
+            and verification.revision_instruction
+            and state.get("answer_revision_count", 0) < 1
+            and state.get("verified_evidence")
+        ):
+            return "revise"
+        return "images"
+
+    def _answer_reviser(self, state: RagGraphState) -> RagGraphState:
+        # 修订节点最多执行一次，且仍只消费原始问题、已验证证据和 verifier 的修订要求。
+        verification = state.get("answer_verification")
+        if not isinstance(verification, AnswerVerification) or not verification.revision_instruction:
+            return state
+        started_at = perf_counter()
+        used_llm = self.llm_provider.uses_llm_for_answer()
+        revised = self.llm_provider.revise_answer_with_evidence(
+            _build_contextual_question(state["question"], state.get("conversation_context")),
+            state.get("answer", ""),
+            state.get("verified_evidence", []),
+            limitations=state.get("limitations", []),
+            revision_instruction=verification.revision_instruction,
+        )
+        latency_ms = (perf_counter() - started_at) * 1000
+        llm_call_counts = increment_llm_call_count(
+            state.get("llm_call_counts"),
+            "answer_revision",
+            used_llm,
+        )
+        diagnostics = dict(state.get("diagnostics", {}))
+        answer_verification = dict(diagnostics.get("answer_verification", {}))
+        answer_verification["revision_applied"] = True
+        diagnostics["answer_verification"] = answer_verification
+        diagnostics["llm_call_counts"] = llm_call_counts
+        diagnostics["answer_revision"] = {
+            "latency_ms": latency_ms,
+            "used_llm": used_llm,
+            "answer_chars": len(revised),
+            "revision_count": state.get("answer_revision_count", 0) + 1,
+        }
+        return {
+            **state,
+            "answer": revised,
+            "answer_revision_count": state.get("answer_revision_count", 0) + 1,
+            "llm_call_counts": llm_call_counts,
+            "diagnostics": diagnostics,
+        }
+
+    def _image_selector(self, state: RagGraphState) -> RagGraphState:
+        # 图像选择与答案生成解耦，并基于完整 route_plan 而不是最终 route 字符串决策。
+        result = self.image_selection_service.select(
+            ImageSelectionContext(
+                question=state["question"],
+                answer=state.get("answer", ""),
+                conversation_context=state.get("conversation_context"),
+                route_plan=state.get("route_plan"),
+                completed_route_steps=state.get("completed_route_steps", []),
+                task_decision=state.get("task_decision"),
+                verified_evidence=state.get("verified_evidence", []),
+                max_images=3,
+            )
+        )
+        llm_call_counts = increment_llm_call_count(
+            state.get("llm_call_counts"),
+            "image_selection",
+            result.used_llm,
+        )
+        diagnostics = {
+            **state.get("diagnostics", {}),
+            "llm_call_counts": llm_call_counts,
+            "image_selection": build_image_selection_diagnostics(
+                strategy=result.strategy,
+                used_llm=result.used_llm,
+                fallback_used=result.fallback_used,
+                candidate_count=result.candidate_count,
+                selected_count=result.selected_count,
+                latency_ms=result.latency_ms,
+                reason=result.reason,
+            ),
+        }
+        diagnostics = _with_selected_image_count(diagnostics, result.images)
+        return {
+            **state,
+            "selected_images": result.images,
+            "llm_call_counts": llm_call_counts,
+            "diagnostics": diagnostics,
+        }
 
 
 def _plan_for_route(route: str) -> str:
@@ -769,6 +987,19 @@ def _current_route_step(state: RagGraphState) -> RouteStep | None:
     return route_plan.steps[index]
 
 
+def _first_new_query(plan: QueryRefinementPlan, attempted_queries: set[str]) -> str | None:
+    for query in plan.queries:
+        if normalized_query(query) not in attempted_queries:
+            return query
+    return None
+
+
+def _stop_reason_from_strategy(decision: RetrievalStrategyDecision) -> str:
+    if decision.reason in {"assessment_fallback", "sufficient_evidence", "max_rounds_reached", "no_new_evidence"}:
+        return decision.reason
+    return "no_search_direction"
+
+
 def _merge_verified_evidence(existing: list[Evidence], current: list[Evidence]) -> list[Evidence]:
     merged = list(existing)
     known = {(item.document_id, item.chunk_id) for item in merged}
@@ -831,35 +1062,6 @@ def _answer_from_document_profiles(question: str, evidence: list[Evidence]) -> s
         snippet = " ".join(item.text.split())[:700]
         lines.append(f"{index}. {title} (p. {item.page_start}): {snippet}")
     return "\n".join(lines)
-
-
-def _select_first_figure_images(evidence: list[Evidence], max_images: int) -> dict[str, list[EvidenceImage]]:
-    selected: dict[str, list[EvidenceImage]] = {}
-    count = 0
-    seen: set[str] = set()
-    for item in evidence:
-        if count >= max_images:
-            break
-        if not item.images:
-            continue
-        image = item.images[0]
-        if image.image_id in seen:
-            continue
-        seen.add(image.image_id)
-        selected[item.chunk_id] = [
-            EvidenceImage(
-                image_id=image.image_id,
-                page=image.page,
-                width=image.width,
-                height=image.height,
-                label=image.label,
-                caption=image.caption,
-                nearby_text=image.nearby_text,
-                reason=image.caption or image.nearby_text or "Selected from the figure index.",
-            )
-        ]
-        count += 1
-    return selected
 
 
 def _with_selected_image_count(

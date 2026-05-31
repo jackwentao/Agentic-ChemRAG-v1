@@ -243,6 +243,6 @@ def _flatten_citation_images(citations: list[Citation]) -> list[CitationImage]:
 def _diagnostics_summary(diagnostics: dict[str, object]) -> dict[str, object]:
     return {
         key: diagnostics.get(key)
-        for key in ["route", "retrieval_round", "max_retrieval_rounds", "stop_reason"]
+        for key in ["route", "retrieval_round", "max_retrieval_rounds", "stop_reason", "answer_verification"]
         if key in diagnostics
     }

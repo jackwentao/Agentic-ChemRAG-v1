@@ -160,9 +160,9 @@ def prepare_database(engine: Engine) -> None:
         conn.execute(
             text(
                 """
-                CREATE INDEX IF NOT EXISTS document_profiles_embedding_idx
-                ON document_profiles USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = 100)
+                -- document_profiles 是单用户文档级画像，默认规模较小。
+                -- 删除历史 ivfflat 索引，让查询保持精确全表向量排序，避免近似召回遗漏。
+                DROP INDEX IF EXISTS document_profiles_embedding_idx
                 """
             )
         )

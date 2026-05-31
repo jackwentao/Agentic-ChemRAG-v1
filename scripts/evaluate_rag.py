@@ -112,6 +112,7 @@ def evaluate_cases(
         limitations = list(state.get("limitations", []))
         diagnostics = dict(state.get("diagnostics", {}))
         assessment_rounds = list(diagnostics.get("assessment_rounds", []))
+        answer_verification = dict(diagnostics.get("answer_verification", {}))
         llm_call_counts = dict(diagnostics.get("llm_call_counts", {}))
         metrics = evaluate_case_metrics(
             case=case,
@@ -126,6 +127,7 @@ def evaluate_cases(
             stop_reason=state.get("stop_reason"),
             assessment_rounds=assessment_rounds,
             llm_call_counts=llm_call_counts,
+            answer_verification=answer_verification,
         )
         result: dict[str, Any] = {
             "case": case_to_dict(case),
@@ -152,6 +154,7 @@ def evaluate_cases(
             "latency_retrieval_ms": float(state.get("retrieval_latency_ms", 0.0)),
             "latency_rerank_ms": float(state.get("rerank_latency_ms", 0.0)),
             "latency_assessment_ms": sum(float(item.get("latency_ms", 0.0)) for item in assessment_rounds),
+            "latency_answer_verification_ms": float(answer_verification.get("latency_ms", 0.0)),
             "rerank_enabled": bool(state.get("rerank_enabled", False)),
             "latency_answer_ms": float(state.get("answer_latency_ms", 0.0)),
         }
@@ -206,6 +209,9 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             "wasted_retry_rate": aggregate_metric_average(results, "wasted_retry"),
             "average_tracked_llm_calls": aggregate_metric_average(results, "total_tracked_llm_calls"),
             "average_assessment_llm_calls": aggregate_metric_average(results, "assessment_llm_calls"),
+            "average_answer_verification_llm_calls": aggregate_metric_average(results, "answer_verification_llm_calls"),
+            "average_answer_revision_llm_calls": aggregate_metric_average(results, "answer_revision_llm_calls"),
+            "average_image_selection_llm_calls": aggregate_metric_average(results, "image_selection_llm_calls"),
         },
     }
     return summary
@@ -591,7 +597,14 @@ def _judge_low_score_lines(results: list[dict[str, Any]]) -> list[str]:
 def _metric_label(name: str) -> str:
     labels = {
         "answer_llm_calls": "回答生成 LLM 调用数",
+        "answer_revision_llm_calls": "答案修订 LLM 调用数",
+        "answer_revision_applied": "答案已修订比例",
+        "answer_revision_required": "答案需修订比例",
         "answer_term_coverage": "答案术语覆盖率",
+        "answer_verification_llm_calls": "答案核验 LLM 调用数",
+        "answer_verification_passed": "答案核验通过率",
+        "answer_verification_triggered": "答案核验触发率",
+        "image_selection_llm_calls": "图片选择 LLM 调用数",
         "aspect_coverage_rate": "预期方面覆盖率",
         "assessment_llm_calls": "证据评估 LLM 调用数",
         "assessment_round_count": "证据评估轮数",
@@ -599,6 +612,7 @@ def _metric_label(name: str) -> str:
         "figure_hit": "图片命中率",
         "first_round_success": "首轮成功率",
         "limitation_disclosure_hit": "限制说明披露命中率",
+        "missing_disclosure_count": "遗漏限制数量",
         "max_rounds_exhausted": "达到最大轮次比例",
         "no_new_evidence_stop": "无新证据停止比例",
         "no_new_query_stop": "无新查询停止比例",
@@ -612,10 +626,12 @@ def _metric_label(name: str) -> str:
         "target_hit": "检索目标命中率",
         "total_tracked_llm_calls": "已追踪 LLM 调用总数",
         "unsupported_claim_risk": "无引用结论风险率",
+        "unsupported_claim_count": "未支撑断言数量",
         "wasted_retry": "无收益重试率",
         "latency_total_ms": "总时延（毫秒）",
         "latency_retrieval_ms": "检索时延（毫秒）",
         "latency_assessment_ms": "证据评估时延（毫秒）",
+        "latency_answer_verification_ms": "答案核验时延（毫秒）",
         "latency_rerank_ms": "重排时延（毫秒）",
         "latency_answer_ms": "回答时延（毫秒）",
         "average_retrieval_rounds": "平均检索轮次",
@@ -624,6 +640,9 @@ def _metric_label(name: str) -> str:
         "wasted_retry_rate": "无收益重试率",
         "average_tracked_llm_calls": "平均已追踪 LLM 调用数",
         "average_assessment_llm_calls": "平均证据评估 LLM 调用数",
+        "average_answer_verification_llm_calls": "平均答案核验 LLM 调用数",
+        "average_answer_revision_llm_calls": "平均答案修订 LLM 调用数",
+        "average_image_selection_llm_calls": "平均图片选择 LLM 调用数",
     }
     if name in labels:
         return labels[name]

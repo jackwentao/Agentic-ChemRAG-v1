@@ -111,11 +111,13 @@ def test_deepseek_image_selector_prompt_includes_caption_and_nearby_text():
         )
     ]
 
-    provider.select_images_for_answer("What changed in PL?", "PL intensity increased.", evidence)
+    result = provider.select_images_for_answer("What changed in PL?", "PL intensity increased.", evidence)
 
     user_message = provider.client.chat.completions.messages[1]["content"]
     assert "Figure 1. Photoluminescence spectra." in user_message
     assert "Emission peaks increase after doping." in user_message
+    assert result.used_llm is True
+    assert result.selected_count == 1
 
 
 def test_fallback_selected_images_uses_figure_references_when_llm_selects_none():
@@ -155,9 +157,11 @@ def test_deepseek_image_selector_falls_back_when_service_connection_is_unavailab
         )
     ]
 
-    selected = provider.select_images_for_answer("What do the PL spectra show?", "Figure 3 shows green emission.", evidence)
+    result = provider.select_images_for_answer("What do the PL spectra show?", "Figure 3 shows green emission.", evidence)
 
-    assert selected["c1"][0].image_id == "img1"
+    assert result.images["c1"][0].image_id == "img1"
+    assert result.used_llm is False
+    assert result.fallback_used is True
 
 
 def test_fallback_selected_images_stays_empty_without_visual_signal():

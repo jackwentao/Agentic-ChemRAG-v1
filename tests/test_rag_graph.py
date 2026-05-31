@@ -1,6 +1,6 @@
 from backend.app.agents.rag_graph import MultiAgentRagGraph
 from backend.app.domain.documents import Chunk, Evidence, EvidenceImage
-from backend.app.domain.rag import EvidenceAssessment, RoutePlan, RouteStep
+from backend.app.domain.rag import AnswerVerification, EvidenceAssessment, ImageSelectionResult, RoutePlan, RouteStep
 from backend.app.providers.embeddings import FakeEmbeddingProvider
 from backend.app.providers.llm import FakeLlmProvider
 from backend.app.repositories.memory import InMemoryVectorRepository
@@ -44,7 +44,13 @@ def test_multi_agent_rag_graph_returns_answer_and_evidence():
     assert state["diagnostics"]["verifier"]["verified_evidence_count"] == 1
     assert state["diagnostics"]["retrieval_rounds"][0]["round_index"] == 1
     assert state["diagnostics"]["assessment_rounds"][0]["round_index"] == 1
-    assert state["diagnostics"]["llm_call_counts"] == {"evidence_assessment": 0, "answer_generation": 0}
+    assert state["diagnostics"]["llm_call_counts"] == {
+        "evidence_assessment": 0,
+        "answer_generation": 0,
+        "answer_verification": 0,
+        "answer_revision": 0,
+        "image_selection": 0,
+    }
     assert state["diagnostics"]["stop_reason"] == "sufficient_evidence"
     assert state["diagnostics"]["llm"]["answer_chars"] > 0
     assert state["total_latency_ms"] >= 0
@@ -75,6 +81,96 @@ def test_multi_agent_rag_graph_selects_answer_images_from_candidates():
 
     assert state["selected_images"]["c1"][0].image_id == "img1"
     assert state["selected_images"]["c1"][0].reason
+
+
+class LlmImageSelectionProvider(FakeLlmProvider):
+    def select_images_for_answer(self, question: str, answer: str, evidence: list[Evidence], max_images: int = 3):
+        image = evidence[0].images[0]
+        selected = {"c1": [EvidenceImage(image_id=image.image_id, page=image.page, reason="Selected by LLM.")]}
+        return ImageSelectionResult(
+            images=selected,
+            strategy="provider_llm",
+            used_llm=True,
+            candidate_count=1,
+            selected_count=1,
+            reason="测试 provider 模拟图片选择模型调用。",
+        )
+
+
+def test_multi_agent_rag_graph_counts_llm_image_selection_calls():
+    embedding_provider = FakeEmbeddingProvider(dimensions=8)
+    graph = MultiAgentRagGraph(RetrievalService(ImageCandidateRepository(), embedding_provider), LlmImageSelectionProvider())
+
+    state = graph.invoke("What morphology is shown?")
+
+    assert state["selected_images"]["c1"][0].image_id == "img1"
+    assert state["diagnostics"]["image_selection"]["used_llm"] is True
+    assert state["diagnostics"]["llm_call_counts"]["image_selection"] == 1
+
+
+def test_multi_agent_rag_graph_triggers_answer_verification_for_high_risk_question():
+    embedding_provider = FakeEmbeddingProvider(dimensions=8)
+    repository = InMemoryVectorRepository()
+    chunk = Chunk(
+        chunk_id="c1",
+        document_id="d1",
+        parent_id="p1",
+        text="The paper reports toxicity observations but does not provide scale-up safety evidence.",
+        page_start=2,
+        page_end=2,
+        section_title="Safety",
+        section_path="Safety",
+        chunk_type="child",
+    )
+    repository.add_chunks([chunk], embedding_provider.embed_documents([chunk.text]))
+
+    graph = MultiAgentRagGraph(RetrievalService(repository, embedding_provider), FakeLlmProvider())
+    state = graph.invoke("Is this material safe for scale-up?")
+
+    verification = state["diagnostics"]["answer_verification"]
+    assert verification["triggered"] is True
+    assert "high_risk" in verification["trigger_reasons"]
+    assert verification["passed"] is True
+    assert state["diagnostics"]["llm_call_counts"]["answer_verification"] == 0
+
+
+class FailingAnswerVerifierProvider(FakeLlmProvider):
+    def __init__(self) -> None:
+        self.revision_calls = 0
+
+    def answer_with_evidence(self, question: str, evidence: list[Evidence]) -> str:
+        return "This unsupported conclusion is safe for scale-up."
+
+    def verify_answer_with_evidence(self, question: str, answer: str, evidence: list[Evidence], **kwargs) -> AnswerVerification:
+        return AnswerVerification(
+            passed=False,
+            triggered=True,
+            trigger_reasons=kwargs["trigger_reasons"],
+            unsupported_claims=["safe for scale-up"],
+            revision_instruction="删除放大安全结论，并保守说明证据边界。",
+            used_llm=True,
+            reason="答案包含未支撑的高风险结论。",
+        )
+
+    def revise_answer_with_evidence(self, question: str, answer: str, evidence: list[Evidence], **kwargs) -> str:
+        self.revision_calls += 1
+        return "证据不足以支持安全放大结论；只能说明文献报告了有限观察。"
+
+
+def test_multi_agent_rag_graph_revises_once_after_failed_answer_verification():
+    repository = TextQueryRoundRepository([[_round_evidence("c1", "The paper reports limited safety observations.")]])
+    provider = FailingAnswerVerifierProvider()
+    graph = MultiAgentRagGraph(RetrievalService(repository, FakeEmbeddingProvider(dimensions=8)), provider)
+
+    state = graph.invoke("Is this material safe for scale-up?")
+
+    assert provider.revision_calls == 1
+    assert state["answer_revision_count"] == 1
+    assert "安全放大结论" in state["answer"]
+    assert state["diagnostics"]["answer_verification"]["passed"] is False
+    assert state["diagnostics"]["answer_verification"]["revision_applied"] is True
+    assert state["diagnostics"]["llm_call_counts"]["answer_verification"] == 1
+    assert state["diagnostics"]["llm_call_counts"]["answer_revision"] == 0
 
 
 class RejectingVerifierProvider(FakeLlmProvider):
@@ -122,7 +218,13 @@ def test_multi_agent_rag_graph_stops_answer_generation_when_verifier_rejects_evi
     assert state["stop_reason"] == "max_rounds_reached"
     assert provider.assessment_calls == 1
     assert len(state["diagnostics"]["assessment_rounds"]) == 1
-    assert state["diagnostics"]["llm_call_counts"] == {"evidence_assessment": 1, "answer_generation": 0}
+    assert state["diagnostics"]["llm_call_counts"] == {
+        "evidence_assessment": 1,
+        "answer_generation": 0,
+        "answer_verification": 0,
+        "answer_revision": 0,
+        "image_selection": 0,
+    }
 
 
 def _round_evidence(chunk_id: str, text: str) -> Evidence:
@@ -196,7 +298,13 @@ def test_multi_agent_rag_graph_retrieves_again_for_missing_aspect_and_assesses_a
     assert state["limitations"] == []
     assert len(state["diagnostics"]["retrieval_rounds"]) == 2
     assert len(state["diagnostics"]["assessment_rounds"]) == 2
-    assert state["diagnostics"]["llm_call_counts"] == {"evidence_assessment": 2, "answer_generation": 0}
+    assert state["diagnostics"]["llm_call_counts"] == {
+        "evidence_assessment": 2,
+        "answer_generation": 0,
+        "answer_verification": 0,
+        "answer_revision": 0,
+        "image_selection": 0,
+    }
 
 
 class NeverSufficientProvider(FakeLlmProvider):
@@ -290,6 +398,43 @@ def test_multi_agent_rag_graph_stops_when_rule_refiner_would_repeat_a_query():
     assert len(repository.queries) == 2
     assert state["stop_reason"] == "no_new_query"
     assert state["retrieval_round"] == 2
+
+
+class LlmRefinementAssessmentProvider(RepeatedRefinementProvider):
+    def __init__(self) -> None:
+        self.refinement_calls = 0
+
+    def refine_search_queries(self, question: str, **kwargs):
+        self.refinement_calls += 1
+        return {
+            "queries": ["catalyst continuous operation durability lifetime"],
+            "search_goal": "use durability and lifetime synonyms",
+            "reason": "complex task uses quality-first query expansion",
+            "safety_notes": [],
+        }
+
+
+def test_multi_agent_rag_graph_uses_llm_refiner_without_changing_route():
+    repository = TextQueryRoundRepository(
+        [
+            [_round_evidence("c1", "Initial result.")],
+            [_round_evidence("c2", "Durability result under continuous operation.")],
+        ]
+    )
+    provider = LlmRefinementAssessmentProvider()
+    graph = MultiAgentRagGraph(
+        RetrievalService(repository, FakeEmbeddingProvider(dimensions=8)),
+        provider,
+    )
+
+    state = graph.invoke("Does catalyst X last in continuous operation?")
+
+    assert provider.refinement_calls >= 1
+    assert len(repository.queries) == 2
+    assert repository.queries[1] == "catalyst continuous operation durability lifetime"
+    assert state["route"] == "chunk_search"
+    assert state["diagnostics"]["retrieval_strategy"]["selected"] == "hybrid"
+    assert state["diagnostics"]["query_refinement"]["used_llm"] is True
 
 
 class FallbackAssessmentProvider(FakeLlmProvider):
@@ -473,3 +618,79 @@ def test_multi_agent_rag_graph_executes_llm_route_plan_steps():
     assert state["selected_images"]["figure:img1"][0].image_id == "img1"
     assert state["diagnostics"]["route_plan"]["used_llm"] is True
     assert state["diagnostics"]["route_plan"]["completed_steps"][1]["route"] == "figure_index"
+
+
+class PlannedFigureThenChunkProvider(FakeLlmProvider):
+    def plan_route(self, question: str, *, conversation_context: str | None, scope: str, document_ids: list[str] | None):
+        return RoutePlan(
+            plan_type="multi_step",
+            rationale="先定位目标图片，再补充文本解释。",
+            used_llm=True,
+            steps=[
+                RouteStep(
+                    step_id="step-1",
+                    route="figure_index",
+                    task_type="figure_query",
+                    query="查找PL相关谱图",
+                    purpose="定位PL相关图题和图片",
+                    max_rounds=1,
+                ),
+                RouteStep(
+                    step_id="step-2",
+                    route="chunk_search",
+                    task_type="simple_fact",
+                    query="解释PL谱图变化",
+                    purpose="补充文字解释",
+                    max_rounds=1,
+                ),
+            ],
+        )
+
+
+class FigureThenChunkRepository:
+    def search_figures(self, query_embedding, top_k=8, document_ids=None):
+        return [
+            Evidence(
+                chunk_id="figure:img1",
+                document_id="d1",
+                text="Figure 2. PL spectra of ZnO samples.",
+                page_start=4,
+                page_end=4,
+                section_title="Figure Index",
+                score=0.92,
+                image_ids=["img1"],
+                images=[EvidenceImage(image_id="img1", page=4, label="Figure 2", caption="Figure 2. PL spectra.")],
+            )
+        ]
+
+    def search(self, query_embedding, top_k=5, document_ids=None):
+        return [
+            Evidence(
+                chunk_id="c1",
+                document_id="d1",
+                text="The PL spectra show stronger green emission after treatment.",
+                page_start=5,
+                page_end=5,
+                section_title="Results",
+                score=0.9,
+                image_ids=["img2"],
+                images=[EvidenceImage(image_id="img2", page=5, caption="Supplementary morphology image.")],
+            )
+        ]
+
+
+def test_multi_step_plan_selects_figure_images_even_when_final_route_is_not_figure():
+    repository = FigureThenChunkRepository()
+    graph = MultiAgentRagGraph(
+        RetrievalService(repository, FakeEmbeddingProvider(dimensions=8)),
+        PlannedFigureThenChunkProvider(),
+    )
+
+    state = graph.invoke("先找PL图，再解释变化。", document_ids=["d1"])
+
+    assert state["route"] == "chunk_search"
+    assert [step["route"] for step in state["completed_route_steps"]] == ["figure_index", "chunk_search"]
+    assert state["selected_images"]["figure:img1"][0].image_id == "img1"
+    assert "c1" not in state["selected_images"]
+    assert state["diagnostics"]["image_selection"]["strategy"] == "figure_index"
+    assert state["diagnostics"]["llm_call_counts"]["image_selection"] == 0

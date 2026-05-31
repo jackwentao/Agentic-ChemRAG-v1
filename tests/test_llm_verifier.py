@@ -1,6 +1,12 @@
 from backend.app.domain.documents import Evidence
 from backend.app.domain.rag import TaskDecision
-from backend.app.providers.llm import ComposedLlmProvider, DeepSeekLlmProvider, FakeLlmProvider, _sanitize_evidence_assessment
+from backend.app.providers.llm import (
+    ComposedLlmProvider,
+    DeepSeekLlmProvider,
+    FakeLlmProvider,
+    _sanitize_answer_verification,
+    _sanitize_evidence_assessment,
+)
 
 
 class ImmediateFuture:
@@ -191,3 +197,46 @@ def test_deepseek_assessor_receives_task_specific_coverage_boundary():
     assert '"task_type": "figure_query"' in user_message
     assert "不要求穷尽全部图片" in user_message
     assert '"max_retrieval_rounds": 2' in user_message
+
+
+def test_deepseek_answer_verifier_requests_claim_level_json():
+    provider = DeepSeekLlmProvider.__new__(DeepSeekLlmProvider)
+    provider.model = "test-model"
+    provider.timeout_seconds = 2.0
+    provider.executor = ImmediateExecutor()
+    provider.client = VerificationClient(
+        '{"passed":false,"unsupported_claims":["声称可安全放大"],'
+        '"missing_disclosures":["缺少长期稳定性"],"citation_errors":[],"overstatements":[],'
+        '"revision_instruction":"删除安全放大结论并披露稳定性缺口。","reason":"答案超过证据。"}'
+    )
+
+    result = provider.verify_answer_with_evidence(
+        "Is this safe to scale-up?",
+        "It is safe to scale-up.",
+        [_evidence()],
+        limitations=["资料缺口：缺少长期稳定性"],
+        task_decision=TaskDecision(task_type="high_risk", requires_retrieval=True, risk_level="high"),
+        evidence_assessment=None,
+        trigger_reasons=["high_risk"],
+    )
+
+    assert result.passed is False
+    assert result.used_llm is True
+    assert result.trigger_reasons == ["high_risk"]
+    assert result.unsupported_claims == ["声称可安全放大"]
+    assert result.missing_disclosures == ["缺少长期稳定性"]
+    assert result.revision_instruction == "删除安全放大结论并披露稳定性缺口。"
+    user_message = provider.client.chat.completions.messages[1]["content"]
+    assert "Is this safe to scale-up?" in user_message
+    assert "资料缺口：缺少长期稳定性" in user_message
+
+
+def test_answer_verification_sanitizer_fails_when_issue_lists_are_nonempty():
+    result = _sanitize_answer_verification(
+        {"passed": True, "unsupported_claims": ["过度结论"], "reason": "模型误判通过。"},
+        ["strong_claim_language"],
+    )
+
+    assert result.passed is False
+    assert result.unsupported_claims == ["过度结论"]
+    assert result.revision_instruction is not None

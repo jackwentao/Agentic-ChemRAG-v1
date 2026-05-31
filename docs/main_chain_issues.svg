@@ -166,10 +166,10 @@
   <rect class="issue-node" x="360" y="844" width="270" height="120" rx="12" />
   <circle class="badge-p1" cx="386" cy="872" r="15" />
   <text class="badge-text" x="377" y="877">P1</text>
-  <text class="issue-title" x="410" y="871">答案核验节点缺失</text>
-  <text class="issue-text" x="410" y="895">AnswerVerification 只是预留契约</text>
-  <text class="issue-text" x="410" y="915">高风险答案无独立 claim check</text>
-  <text class="issue-text" x="410" y="935">没有受控修订路径</text>
+  <text class="issue-title" x="410" y="871">答案核验已接入</text>
+  <text class="issue-text" x="410" y="895">高风险/冲突/低置信触发核验</text>
+  <text class="issue-text" x="410" y="915">失败时最多一次受控修订</text>
+  <text class="issue-text" x="410" y="935">仍缺修订后二次 claim check</text>
 
   <rect class="risk-node" x="690" y="860" width="210" height="86" rx="12" />
   <text class="node-title" x="716" y="889">ImageSelector</text>

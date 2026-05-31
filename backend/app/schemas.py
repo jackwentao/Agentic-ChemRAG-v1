@@ -251,6 +251,42 @@ class AssessmentRoundDiagnostics(BaseModel):
 class LlmCallCountsDiagnostics(BaseModel):
     evidence_assessment: int = 0
     answer_generation: int = 0
+    answer_verification: int = 0
+    answer_revision: int = 0
+    image_selection: int = 0
+
+
+class AnswerVerificationDiagnostics(BaseModel):
+    latency_ms: float = 0.0
+    triggered: bool = False
+    passed: bool = True
+    trigger_reasons: list[str] = Field(default_factory=list)
+    unsupported_claim_count: int = 0
+    missing_disclosure_count: int = 0
+    citation_error_count: int = 0
+    overstatement_count: int = 0
+    unsupported_claims: list[str] = Field(default_factory=list)
+    missing_disclosures: list[str] = Field(default_factory=list)
+    citation_errors: list[str] = Field(default_factory=list)
+    overstatements: list[str] = Field(default_factory=list)
+    revision_required: bool = False
+    revision_applied: bool = False
+    revision_instruction: str | None = None
+    used_llm: bool = False
+    fallback_used: bool = False
+    reason: str = ""
+    proxy_hit: bool = False
+
+
+class ImageSelectionDiagnostics(BaseModel):
+    strategy: str = "none"
+    used_llm: bool = False
+    fallback_used: bool = False
+    candidate_count: int = 0
+    selected_count: int = 0
+    latency_ms: float = 0.0
+    reason: str = ""
+    proxy_hit: bool = False
 
 
 class ChatDiagnostics(BaseModel):
@@ -267,6 +303,8 @@ class ChatDiagnostics(BaseModel):
     recall: RecallDiagnostics | None = None
     rerank: RerankDiagnostics | None = None
     verifier: VerifierDiagnostics | None = None
+    answer_verification: AnswerVerificationDiagnostics | None = None
+    image_selection: ImageSelectionDiagnostics | None = None
     llm: LlmDiagnostics | None = None
 
 

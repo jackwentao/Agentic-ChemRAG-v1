@@ -5,7 +5,14 @@ import re
 
 from backend.app.config import Settings
 from backend.app.domain.documents import Evidence, EvidenceImage
-from backend.app.domain.rag import EvidenceAssessment, RoutePlan, RouteStep, TaskDecision
+from backend.app.domain.rag import (
+    AnswerVerification,
+    EvidenceAssessment,
+    ImageSelectionResult,
+    RoutePlan,
+    RouteStep,
+    TaskDecision,
+)
 
 
 class LlmProvider(ABC):
@@ -53,14 +60,66 @@ class LlmProvider(ABC):
     ) -> EvidenceAssessment:
         return self.assess_evidence(question, evidence)
 
+    def refine_search_queries(
+        self,
+        question: str,
+        *,
+        assessment: EvidenceAssessment,
+        task_decision: TaskDecision | None,
+        route: str,
+        scope: str,
+        attempted_queries: list[str],
+        max_queries: int,
+        safety_mode: str,
+    ) -> dict[str, object] | None:
+        return None
+
+    def verify_answer_with_evidence(
+        self,
+        question: str,
+        answer: str,
+        evidence: list[Evidence],
+        *,
+        limitations: list[str],
+        task_decision: TaskDecision | None,
+        evidence_assessment: EvidenceAssessment | None,
+        trigger_reasons: list[str],
+    ) -> AnswerVerification:
+        return AnswerVerification(
+            passed=True,
+            triggered=bool(trigger_reasons),
+            trigger_reasons=trigger_reasons,
+            reason="当前 provider 未实现答案级核验，默认通过。",
+            fallback_used=True,
+        )
+
+    def revise_answer_with_evidence(
+        self,
+        question: str,
+        answer: str,
+        evidence: list[Evidence],
+        *,
+        limitations: list[str],
+        revision_instruction: str,
+    ) -> str:
+        if limitations and "资料限制" not in answer:
+            return "\n".join([answer, "", "资料限制：", *[f"- {item}" for item in limitations]])
+        return answer
+
     def select_images_for_answer(
         self,
         question: str,
         answer: str,
         evidence: list[Evidence],
         max_images: int = 3,
-    ) -> dict[str, list[EvidenceImage]]:
-        return {}
+    ) -> ImageSelectionResult:
+        return ImageSelectionResult(
+            images={},
+            strategy="none",
+            candidate_count=_image_candidate_count(evidence),
+            selected_count=0,
+            reason="当前 provider 未实现图片选择。",
+        )
 
 
 class DeepSeekLlmProvider(LlmProvider):
@@ -259,15 +318,211 @@ class DeepSeekLlmProvider(LlmProvider):
             raise
         return _sanitize_evidence_assessment(payload, valid_evidence)
 
+    def refine_search_queries(
+        self,
+        question: str,
+        *,
+        assessment: EvidenceAssessment,
+        task_decision: TaskDecision | None,
+        route: str,
+        scope: str,
+        attempted_queries: list[str],
+        max_queries: int,
+        safety_mode: str,
+    ) -> dict[str, object] | None:
+        context = {
+            "route": route,
+            "scope": scope,
+            "task_type": task_decision.task_type if task_decision else "unknown",
+            "risk_level": task_decision.risk_level if task_decision else "unknown",
+            "missing_aspects": assessment.missing_aspects,
+            "conflicts": assessment.conflicts,
+            "next_search_goal": assessment.next_search_goal,
+            "attempted_queries": attempted_queries[-8:],
+            "max_queries": max(1, min(max_queries, 3)),
+            "safety_mode": safety_mode,
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是化学与材料文献 RAG 系统的补充检索 query 生成器。"
+                    "只生成下一轮检索 query，不回答问题，不扩展用户没有要求的材料、文档范围或实验目标。"
+                    "query 必须服务于补足 missing_aspects、conflicts 或 next_search_goal。"
+                    "如果 safety_mode 是 conservative，禁止生成精确剂量、温度步骤、放大操作或可执行实验流程 query，"
+                    "只能检索文献中已报告的限制、风险、概述性条件和证据充分性。"
+                    "严格输出 JSON："
+                    '{"queries":["..."],"search_goal":"...","reason":"...","safety_notes":["..."]}。'
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"用户问题：\n{question}\n\n"
+                    f"补充检索上下文：\n{json.dumps(context, ensure_ascii=False)}"
+                ),
+            },
+        ]
+        future = self.executor.submit(
+            self.client.chat.completions.create,
+            model=self.model,
+            messages=messages,
+            response_format={"type": "json_object"},
+        )
+        try:
+            response = future.result(timeout=min(self.timeout_seconds, 3))
+            payload = json.loads(response.choices[0].message.content or "{}")
+        except (FutureTimeoutError, json.JSONDecodeError):
+            return None
+        except Exception as exc:
+            if _is_recoverable_llm_error(exc):
+                return None
+            raise
+        return payload if isinstance(payload, dict) else None
+
+    def verify_answer_with_evidence(
+        self,
+        question: str,
+        answer: str,
+        evidence: list[Evidence],
+        *,
+        limitations: list[str],
+        task_decision: TaskDecision | None,
+        evidence_assessment: EvidenceAssessment | None,
+        trigger_reasons: list[str],
+    ) -> AnswerVerification:
+        candidates = [
+            {
+                "chunk_id": item.chunk_id,
+                "document_id": item.document_id,
+                "pages": f"{item.page_start}-{item.page_end}",
+                "section_title": item.section_title,
+                "text": item.text[:1800],
+            }
+            for item in evidence
+        ]
+        context = {
+            "task_type": task_decision.task_type if task_decision else "unknown",
+            "risk_level": task_decision.risk_level if task_decision else "unknown",
+            "limitations": limitations,
+            "trigger_reasons": trigger_reasons,
+            "evidence_assessment": {
+                "sufficient": evidence_assessment.sufficient if evidence_assessment else None,
+                "covered_aspects": evidence_assessment.covered_aspects if evidence_assessment else [],
+                "missing_aspects": evidence_assessment.missing_aspects if evidence_assessment else [],
+                "conflicts": evidence_assessment.conflicts if evidence_assessment else [],
+                "confidence": evidence_assessment.confidence if evidence_assessment else None,
+            },
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是化学与材料文献问答系统的答案核验器。"
+                    "只检查最终答案是否被给定证据直接支撑，不要重新回答问题。"
+                    "找出未支撑断言、遗漏的资料限制、引用或证据对应错误、以及超过证据强度的表述。"
+                    "高风险问题必须更保守：不能允许可执行实验步骤、放大建议或安全结论超出证据。"
+                    "如果需要修改，给出 revision_instruction；不要输出新答案。"
+                    "严格输出 JSON："
+                    '{"passed":true或false,"unsupported_claims":["..."],'
+                    '"missing_disclosures":["..."],"citation_errors":["..."],'
+                    '"overstatements":["..."],"revision_instruction":"..."或null,"reason":"简短理由"}。'
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"用户问题：\n{question}\n\n"
+                    f"最终答案：\n{answer}\n\n"
+                    f"核验上下文：\n{json.dumps(context, ensure_ascii=False)}\n\n"
+                    f"已验证证据：\n{json.dumps(candidates, ensure_ascii=False)}"
+                ),
+            },
+        ]
+        future = self.executor.submit(
+            self.client.chat.completions.create,
+            model=self.model,
+            messages=messages,
+            response_format={"type": "json_object"},
+        )
+        try:
+            response = future.result(timeout=self.timeout_seconds)
+            payload = json.loads(response.choices[0].message.content or "{}")
+        except (FutureTimeoutError, json.JSONDecodeError):
+            return _fallback_answer_verification(trigger_reasons, "答案核验响应超时或格式无效，已要求保守保留限制说明。")
+        except Exception as exc:
+            if _is_recoverable_llm_error(exc):
+                return _fallback_answer_verification(trigger_reasons, "答案核验服务暂时不可用，已要求保守保留限制说明。")
+            raise
+        return _sanitize_answer_verification(payload, trigger_reasons)
+
+    def revise_answer_with_evidence(
+        self,
+        question: str,
+        answer: str,
+        evidence: list[Evidence],
+        *,
+        limitations: list[str],
+        revision_instruction: str,
+    ) -> str:
+        context = "\n\n".join(
+            f"[{idx + 1}] page {item.page_start}-{item.page_end}, {item.section_title}\n{item.text[:1800]}"
+            for idx, item in enumerate(evidence)
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是化学与材料文献问答系统的答案修订器。"
+                    "只能依据给定证据和修订要求改写答案，不能新增证据、不能扩大用户问题范围。"
+                    "必须保留必要的资料限制；高风险问题应保守表达。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"用户问题：\n{question}\n\n"
+                    f"原答案：\n{answer}\n\n"
+                    f"修订要求：\n{revision_instruction}\n\n"
+                    f"必须披露的资料限制：\n{json.dumps(limitations, ensure_ascii=False)}\n\n"
+                    f"已验证证据：\n{context}"
+                ),
+            },
+        ]
+        future = self.executor.submit(self.client.chat.completions.create, model=self.model, messages=messages)
+        try:
+            response = future.result(timeout=self.timeout_seconds)
+            revised = response.choices[0].message.content or ""
+        except Exception as exc:
+            if _is_recoverable_llm_error(exc):
+                return super().revise_answer_with_evidence(
+                    question,
+                    answer,
+                    evidence,
+                    limitations=limitations,
+                    revision_instruction=revision_instruction,
+                )
+            raise
+        return revised.strip() or answer
+
     def select_images_for_answer(
         self,
         question: str,
         answer: str,
         evidence: list[Evidence],
         max_images: int = 3,
-    ) -> dict[str, list[EvidenceImage]]:
+    ) -> ImageSelectionResult:
+        candidate_count = _image_candidate_count(evidence)
         if not getattr(self, "image_selection_enabled", True):
-            return _fallback_selected_images(question, answer, evidence, max_images)
+            selected = _fallback_selected_images(question, answer, evidence, max_images)
+            return _image_selection_result(
+                selected,
+                strategy="fallback",
+                used_llm=False,
+                fallback_used=True,
+                candidate_count=candidate_count,
+                reason="图片选择模型未启用，使用本地启发式选择。",
+            )
 
         candidates = []
         by_chunk: dict[str, dict[str, EvidenceImage]] = {}
@@ -289,7 +544,13 @@ class DeepSeekLlmProvider(LlmProvider):
                     }
                 )
         if not candidates:
-            return {}
+            return ImageSelectionResult(
+                images={},
+                strategy="none",
+                candidate_count=0,
+                selected_count=0,
+                reason="没有可选择的候选图片。",
+            )
 
         messages = [
             {
@@ -319,14 +580,47 @@ class DeepSeekLlmProvider(LlmProvider):
             )
         except Exception as exc:
             if _is_recoverable_llm_error(exc):
-                return _fallback_selected_images(question, answer, evidence, max_images)
+                selected = _fallback_selected_images(question, answer, evidence, max_images)
+                return _image_selection_result(
+                    selected,
+                    strategy="fallback",
+                    used_llm=False,
+                    fallback_used=True,
+                    candidate_count=candidate_count,
+                    reason="图片选择模型连接不可用，使用本地启发式选择。",
+                )
             raise
         try:
             payload = json.loads(response.choices[0].message.content or "{}")
         except json.JSONDecodeError:
-            return _fallback_selected_images(question, answer, evidence, max_images)
+            selected = _fallback_selected_images(question, answer, evidence, max_images)
+            return _image_selection_result(
+                selected,
+                strategy="fallback_after_llm",
+                used_llm=True,
+                fallback_used=True,
+                candidate_count=candidate_count,
+                reason="图片选择模型返回非 JSON，使用本地启发式选择。",
+            )
         selected = _sanitize_selected_images(payload.get("images", []), by_chunk, max_images)
-        return selected or _fallback_selected_images(question, answer, evidence, max_images)
+        if selected:
+            return _image_selection_result(
+                selected,
+                strategy="provider_llm",
+                used_llm=True,
+                fallback_used=False,
+                candidate_count=candidate_count,
+                reason="图片选择模型从候选图片中选择了相关图片。",
+            )
+        selected = _fallback_selected_images(question, answer, evidence, max_images)
+        return _image_selection_result(
+            selected,
+            strategy="fallback_after_llm",
+            used_llm=True,
+            fallback_used=True,
+            candidate_count=candidate_count,
+            reason="图片选择模型未返回可用图片，使用本地启发式选择。",
+        )
 
 
 class FakeLlmProvider(LlmProvider):
@@ -356,7 +650,7 @@ class FakeLlmProvider(LlmProvider):
         answer: str,
         evidence: list[Evidence],
         max_images: int = 3,
-    ) -> dict[str, list[EvidenceImage]]:
+    ) -> ImageSelectionResult:
         selected: dict[str, list[EvidenceImage]] = {}
         remaining = max_images
         for item in evidence:
@@ -378,7 +672,40 @@ class FakeLlmProvider(LlmProvider):
                 )
             ]
             remaining -= 1
-        return selected
+        return _image_selection_result(
+            selected,
+            strategy="fake_provider",
+            used_llm=False,
+            fallback_used=False,
+            candidate_count=_image_candidate_count(evidence),
+            reason="测试 provider 从候选证据图片中确定性选择。",
+        )
+
+    def verify_answer_with_evidence(
+        self,
+        question: str,
+        answer: str,
+        evidence: list[Evidence],
+        *,
+        limitations: list[str],
+        task_decision: TaskDecision | None,
+        evidence_assessment: EvidenceAssessment | None,
+        trigger_reasons: list[str],
+    ) -> AnswerVerification:
+        unsupported = ["答案包含测试用未支撑断言。"] if "unsupported" in answer.lower() else []
+        missing = []
+        if limitations and not any(marker in answer for marker in ["资料限制", "不足", "缺口", "无法确认"]):
+            missing = limitations
+        passed = not unsupported and not missing
+        return AnswerVerification(
+            passed=passed,
+            triggered=bool(trigger_reasons),
+            trigger_reasons=trigger_reasons,
+            unsupported_claims=unsupported,
+            missing_disclosures=missing,
+            revision_instruction="删除未支撑断言并补充资料限制。" if not passed else None,
+            reason="测试 provider 完成答案核验。",
+        )
 
 
 class ComposedLlmProvider(LlmProvider):
@@ -436,13 +763,74 @@ class ComposedLlmProvider(LlmProvider):
             max_retrieval_rounds=max_retrieval_rounds,
         )
 
+    def refine_search_queries(
+        self,
+        question: str,
+        *,
+        assessment: EvidenceAssessment,
+        task_decision: TaskDecision | None,
+        route: str,
+        scope: str,
+        attempted_queries: list[str],
+        max_queries: int,
+        safety_mode: str,
+    ) -> dict[str, object] | None:
+        return self.answer_provider.refine_search_queries(
+            question,
+            assessment=assessment,
+            task_decision=task_decision,
+            route=route,
+            scope=scope,
+            attempted_queries=attempted_queries,
+            max_queries=max_queries,
+            safety_mode=safety_mode,
+        )
+
+    def verify_answer_with_evidence(
+        self,
+        question: str,
+        answer: str,
+        evidence: list[Evidence],
+        *,
+        limitations: list[str],
+        task_decision: TaskDecision | None,
+        evidence_assessment: EvidenceAssessment | None,
+        trigger_reasons: list[str],
+    ) -> AnswerVerification:
+        return self.assessment_provider.verify_answer_with_evidence(
+            question,
+            answer,
+            evidence,
+            limitations=limitations,
+            task_decision=task_decision,
+            evidence_assessment=evidence_assessment,
+            trigger_reasons=trigger_reasons,
+        )
+
+    def revise_answer_with_evidence(
+        self,
+        question: str,
+        answer: str,
+        evidence: list[Evidence],
+        *,
+        limitations: list[str],
+        revision_instruction: str,
+    ) -> str:
+        return self.answer_provider.revise_answer_with_evidence(
+            question,
+            answer,
+            evidence,
+            limitations=limitations,
+            revision_instruction=revision_instruction,
+        )
+
     def select_images_for_answer(
         self,
         question: str,
         answer: str,
         evidence: list[Evidence],
         max_images: int = 3,
-    ) -> dict[str, list[EvidenceImage]]:
+    ) -> ImageSelectionResult:
         return self.answer_provider.select_images_for_answer(question, answer, evidence, max_images)
 
 
@@ -547,6 +935,45 @@ def _fallback_evidence_assessment(evidence: list[Evidence], reason: str) -> Evid
     )
 
 
+def _sanitize_answer_verification(payload: object, trigger_reasons: list[str]) -> AnswerVerification:
+    if not isinstance(payload, dict):
+        return _fallback_answer_verification(trigger_reasons, "答案核验返回结构无效，已要求保守保留限制说明。")
+    unsupported_claims = _sanitize_string_list(payload.get("unsupported_claims"))
+    missing_disclosures = _sanitize_string_list(payload.get("missing_disclosures"))
+    citation_errors = _sanitize_string_list(payload.get("citation_errors"))
+    overstatements = _sanitize_string_list(payload.get("overstatements"))
+    revision_instruction = str(payload.get("revision_instruction") or "").strip()[:800] or None
+    failed_items = unsupported_claims or missing_disclosures or citation_errors or overstatements
+    passed = bool(payload.get("passed", not failed_items)) and not failed_items
+    if not passed and revision_instruction is None:
+        revision_instruction = "删除或改写未被证据直接支撑的断言，并补充遗漏的资料限制。"
+    return AnswerVerification(
+        passed=passed,
+        triggered=bool(trigger_reasons),
+        trigger_reasons=list(trigger_reasons),
+        unsupported_claims=unsupported_claims,
+        missing_disclosures=missing_disclosures,
+        citation_errors=citation_errors,
+        overstatements=overstatements,
+        revision_instruction=revision_instruction,
+        used_llm=True,
+        reason=str(payload.get("reason") or ("答案核验通过。" if passed else "答案核验发现需要修订的问题。"))[:500],
+    )
+
+
+def _fallback_answer_verification(trigger_reasons: list[str], reason: str) -> AnswerVerification:
+    return AnswerVerification(
+        passed=False,
+        triggered=bool(trigger_reasons),
+        trigger_reasons=list(trigger_reasons),
+        missing_disclosures=["答案级核验未完成，输出必须保留资料限制并避免扩大结论。"],
+        revision_instruction="保留资料限制，删除任何没有直接证据支撑的强结论。",
+        used_llm=True,
+        fallback_used=True,
+        reason=reason,
+    )
+
+
 def _sanitize_string_list(value: object, limit: int = 12) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -638,6 +1065,34 @@ def _fallback_selected_images(
         )
         seen.add(image.image_id)
     return result
+
+
+def _image_candidate_count(evidence: list[Evidence]) -> int:
+    return sum(len(item.images) for item in evidence)
+
+
+def _selected_image_count(selected: dict[str, list[EvidenceImage]]) -> int:
+    return sum(len(images) for images in selected.values())
+
+
+def _image_selection_result(
+    selected: dict[str, list[EvidenceImage]],
+    *,
+    strategy: str,
+    used_llm: bool,
+    fallback_used: bool,
+    candidate_count: int,
+    reason: str,
+) -> ImageSelectionResult:
+    return ImageSelectionResult(
+        images=selected,
+        strategy=strategy,
+        used_llm=used_llm,
+        fallback_used=fallback_used,
+        candidate_count=candidate_count,
+        selected_count=_selected_image_count(selected),
+        reason=reason,
+    )
 
 
 def _meaningful_terms(text: str) -> set[str]:

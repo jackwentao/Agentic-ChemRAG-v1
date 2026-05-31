@@ -450,8 +450,6 @@ class PgVectorRepository:
         if document_ids:
             params["document_ids"] = document_ids
         with self.engine.begin() as conn:
-            conn.execute(text("SET LOCAL enable_indexscan = off"))
-            conn.execute(text("SET LOCAL enable_bitmapscan = off"))
             rows = conn.execute(sql, params).mappings().all()
 
         evidence: list[Evidence] = []
@@ -543,8 +541,6 @@ class PgVectorRepository:
         if document_ids:
             params["document_ids"] = document_ids
         with self.engine.begin() as conn:
-            conn.execute(text("SET LOCAL enable_indexscan = off"))
-            conn.execute(text("SET LOCAL enable_bitmapscan = off"))
             rows = conn.execute(sql, params).mappings().all()
 
         evidence: list[Evidence] = []

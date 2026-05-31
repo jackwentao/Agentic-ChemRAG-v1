@@ -214,7 +214,7 @@ def test_adaptive_retrieval_metrics_report_retry_gain_disclosure_and_cost():
         retrieval_round=2,
         stop_reason="sufficient_evidence",
         assessment_rounds=[{"round_index": 1}, {"round_index": 2}],
-        llm_call_counts={"evidence_assessment": 2, "answer_generation": 1},
+        llm_call_counts={"evidence_assessment": 2, "answer_generation": 1, "image_selection": 1},
     )
 
     assert metrics["retry_triggered"] is True
@@ -224,7 +224,8 @@ def test_adaptive_retrieval_metrics_report_retry_gain_disclosure_and_cost():
     assert metrics["limitation_disclosure_hit"] is True
     assert metrics["aspect_coverage_rate"] == 1.0
     assert metrics["assessment_round_count"] == 2
-    assert metrics["total_tracked_llm_calls"] == 3
+    assert metrics["image_selection_llm_calls"] == 1
+    assert metrics["total_tracked_llm_calls"] == 4
 
 
 def test_latency_summary_reports_p50_p95_and_max():

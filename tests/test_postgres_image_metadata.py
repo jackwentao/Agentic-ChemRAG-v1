@@ -1,4 +1,4 @@
-from backend.app.domain.documents import StoredImage
+from backend.app.domain.documents import DocumentProfile, StoredImage
 from backend.app.database import prepare_database
 from backend.app.repositories.postgres import PgVectorRepository
 
@@ -62,6 +62,9 @@ def test_prepare_database_adds_image_metadata_columns():
     assert "ALTER TABLE images ADD COLUMN IF NOT EXISTS nearby_text TEXT" in statements
     assert "CREATE TABLE IF NOT EXISTS figures" in statements
     assert "CREATE TABLE IF NOT EXISTS document_profiles" in statements
+    assert "CREATE INDEX IF NOT EXISTS figures_embedding_idx" in statements
+    assert "CREATE INDEX IF NOT EXISTS document_profiles_embedding_idx" not in statements
+    assert "DROP INDEX IF EXISTS document_profiles_embedding_idx" in statements
 
 
 def test_pgvector_repository_add_images_persists_caption_metadata():
@@ -164,3 +167,80 @@ def test_pgvector_repository_add_figures_and_search_returns_figure_evidence():
     assert engine.calls[0][1]["figure_id"] == "img1"
     assert evidence[0].chunk_id == "figure:img1"
     assert evidence[0].images[0].label == "Figure 2"
+
+
+def test_pgvector_repository_vector_searches_do_not_disable_index_scans():
+    engine = FakeEngine()
+    engine.figure_rows = [
+        {
+            "figure_id": "fig1",
+            "image_id": "img1",
+            "document_id": "doc1",
+            "page": 1,
+            "label": "Figure 1",
+            "caption": "Band gap trend.",
+            "nearby_text": None,
+            "width": 320,
+            "height": 240,
+            "score": 0.91,
+        }
+    ]
+    engine.profile_rows = [
+        {
+            "document_id": "doc1",
+            "title": "Photocatalyst profile",
+            "abstract": None,
+            "summary_text": "Summary for photocatalyst document.",
+            "topics": [],
+            "entities": [],
+            "figure_summary": None,
+            "score": 0.87,
+        }
+    ]
+    repository = PgVectorRepository(engine)
+
+    figure_evidence = repository.search_figures([0.1, 0.2], top_k=1)
+    profile_evidence = repository.search_document_profiles([0.1, 0.2], top_k=1)
+
+    statements = "\n".join(sql for sql, _params in engine.calls)
+    assert "SET LOCAL enable_indexscan = off" not in statements
+    assert "SET LOCAL enable_bitmapscan = off" not in statements
+    assert figure_evidence[0].chunk_id == "figure:fig1"
+    assert profile_evidence[0].chunk_id == "profile:doc1"
+
+
+def test_pgvector_repository_upserts_and_searches_document_profile():
+    engine = FakeEngine()
+    engine.profile_rows = [
+        {
+            "document_id": "doc1",
+            "title": "Photocatalyst profile",
+            "abstract": "Abstract text.",
+            "summary_text": "Document level summary.",
+            "topics": ["photocatalysis"],
+            "entities": ["TiO2"],
+            "figure_summary": "Figure summary.",
+            "score": 0.82,
+        }
+    ]
+    repository = PgVectorRepository(engine)
+
+    repository.upsert_document_profile(
+        DocumentProfile(
+            document_id="doc1",
+            title="Photocatalyst profile",
+            abstract="Abstract text.",
+            summary_text="Document level summary.",
+            topics=["photocatalysis"],
+            entities=["TiO2"],
+            figure_summary="Figure summary.",
+        ),
+        [0.1, 0.2],
+    )
+    evidence = repository.search_document_profiles([0.1, 0.2], top_k=1)
+
+    assert engine.calls[0][1]["document_id"] == "doc1"
+    assert engine.calls[0][1]["topics"] == '["photocatalysis"]'
+    assert engine.calls[0][1]["entities"] == '["TiO2"]'
+    assert evidence[0].chunk_id == "profile:doc1"
+    assert evidence[0].section_title == "Photocatalyst profile"

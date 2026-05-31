@@ -41,7 +41,7 @@ class FakeGraph:
                     {"round_index": 1, "latency_ms": 1.2, "sufficient": False},
                     {"round_index": 2, "latency_ms": 1.5, "sufficient": True},
                 ],
-                "llm_call_counts": {"evidence_assessment": 2, "answer_generation": 0},
+                "llm_call_counts": {"evidence_assessment": 2, "answer_generation": 0, "image_selection": 1},
             },
         }
 
@@ -135,9 +135,10 @@ def test_evaluate_cases_records_route_metrics_outputs_and_latencies():
     assert result["latency_rerank_ms"] == 2.5
     assert result["rerank_enabled"] is True
     assert result["latency_assessment_ms"] == 2.7
-    assert result["llm_call_counts"] == {"evidence_assessment": 2, "answer_generation": 0}
+    assert result["llm_call_counts"] == {"evidence_assessment": 2, "answer_generation": 0, "image_selection": 1}
     assert result["metrics"]["observed_retry_success"] is True
-    assert result["metrics"]["total_tracked_llm_calls"] == 2
+    assert result["metrics"]["image_selection_llm_calls"] == 1
+    assert result["metrics"]["total_tracked_llm_calls"] == 3
     assert result["diagnostics"]["rerank"]["candidate_count"] == 8
     assert "by_expected_route" in report["summary"]
     assert "by_task_category" in report["summary"]

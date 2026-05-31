@@ -179,6 +179,6 @@ CREATE INDEX IF NOT EXISTS figures_embedding_idx
 ON figures USING ivfflat (embedding vector_cosine_ops)
 WITH (lists = 100);
 
-CREATE INDEX IF NOT EXISTS document_profiles_embedding_idx
-ON document_profiles USING ivfflat (embedding vector_cosine_ops)
-WITH (lists = 100);
+-- document_profiles 是单用户文档级画像，默认规模较小。
+-- 这里不创建 ivfflat 近似索引，保留精确全表向量排序，避免文档级召回遗漏。
+DROP INDEX IF EXISTS document_profiles_embedding_idx;

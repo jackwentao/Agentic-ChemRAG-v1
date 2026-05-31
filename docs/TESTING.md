@@ -66,7 +66,7 @@ npm run build
 
 ## 第二批多轮检索验证
 
-第二批新增程序控制的补充检索闭环，并保持查询生成不产生额外 LLM 调用。针对性验证命令：
+第二批新增程序控制的补充检索闭环；当前补充检索已升级为规则、LLM 与混合策略并存，默认在 LLM 不可用时回退到规则路径。针对性验证命令：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest tests\test_rag_graph.py tests\test_api.py tests\test_evaluate_rag.py
@@ -92,12 +92,12 @@ npm run build
 
 验收重点：
 
-- API 诊断提供 `assessment_rounds` 与 `llm_call_counts`，分别用于逐轮解释证据判断和统计按节点路径标记使用 LLM 的阶段调用；后者是架构比较指标，不是账单计数。
+- API 诊断提供 `assessment_rounds`、`answer_verification`、`image_selection` 与 `llm_call_counts`，分别用于逐轮解释证据判断、解释答案级核验触发/修订、解释图片选择策略，以及统计按节点路径标记使用 LLM 的阶段调用；后者是架构比较指标，不是账单计数。
 - 黄金样例兼容旧字段，并可新增任务类别、风险等级、预期覆盖面、必须披露限制、预期检索行为和最大可接受轮次。
-- 离线报告输出首轮成功率、重试触发率、观察到的重试成功率、无收益重试率、平均检索轮次及平均已追踪 LLM 调用。
+- 离线报告输出首轮成功率、重试触发率、观察到的重试成功率、无收益重试率、平均检索轮次、平均图片选择 LLM 调用及平均已追踪 LLM 调用。
 - 默认质量评测即使使用 `fake` 回答，也由已配置真实模型判断证据是否充分；纯 fake 判断仅供无需网络和 API 调用的确定性回归。
 - `latest.md` 使用中文说明评测模式、指标、停止原因、分类结果和失败案例。
-- 图片选择的模型调用尚未纳入 `llm_call_counts`，因为当前 provider 未暴露可可靠区分模型调用与回退选择的状态。
+- 图片选择已通过 `image_selection` 诊断暴露策略、候选数、命中数、`used_llm` 与 `fallback_used`；当 provider 明确返回 `used_llm=true` 时，会计入 `llm_call_counts.image_selection`。
 
 ## 第四批任务预算与增量重排验证
 
@@ -113,15 +113,17 @@ npm run build
 | --- | --- | --- |
 | `TaskClassifier` / `BudgetPolicy` | 简单事实为一轮；图片/总结为两轮；多条件与高风险为三轮 | `tests/test_task_policy.py` |
 | `Retriever` / `Reranker` | 第二轮传入历史证据键，只重排新增候选；诊断记录被排除数量 | `tests/test_retrieval_service.py` |
+| `Figure/Profile Light Path` | 图片查询走 figure 索引；文档画像走 profile 索引且跳过重排；两类回答不调用通用答案生成 | `tests/test_rag_graph.py`、`tests/test_retrieval_service.py` |
 | `EvidenceAssessor` | 真实模型输入包含任务类型与明确覆盖边界，不扩大用户要求 | `tests/test_llm_verifier.py` |
 | `RetrievalController` | 简单事实证据不足首轮停止；复杂问题仍允许补查 | `tests/test_rag_graph.py` |
 | `Planner` / `QueryRouter` | 固定问题落入正确检索路由，缓存预热不改变判断结果 | `tests/test_query_router.py` |
-| `QueryRefiner` | 固定缺口生成补充查询；重复查询及时停止 | `tests/test_rag_graph.py` |
-| `Answerer` / `ImageSelector` | 仅使用已验证证据生成回答与选择图片；不足时保守输出 | `tests/test_rag_graph.py`、`tests/test_image_selection.py` |
+| `QueryRefiner` / `RetrievalStrategySelector` | 固定缺口生成补充查询；复杂任务可走混合/LLM；重复查询及时停止 | `tests/test_retrieval_refinement.py`、`tests/test_rag_graph.py` |
+| `Answerer` / `ImageSelector` | 仅使用已验证证据生成回答与选择图片；图片选择基于完整 `route_plan`、已完成步骤和最终证据判断策略；不足时保守输出 | `tests/test_rag_graph.py`、`tests/test_image_selection.py` |
+| `AnswerVerificationPolicy` / `AnswerVerifier` | 高风险、冲突、低置信度或强断言触发核验；失败时最多一次受控修订 | `tests/test_rag_graph.py`、`tests/test_llm_verifier.py` |
 | `ChatDiagnostics` | API 输出任务类型、动态预算与阶段诊断 | `tests/test_api.py` |
 | `EvaluationWarmup` / `ReportRenderer` | embedding、路由、重排独立预热并在中文报告展示 | `tests/test_evaluate_rag.py` |
 
-下一轮提醒：优先实现**图片查询**和**文档画像查询**的专用轻路径，再比较是否需要引入 LLM 查询重写。
+下一轮提醒：图片查询与文档画像查询已具备专用召回、画像跳过重排和确定性回答的第一阶段轻路径；后续测试重点应放在第二阶段轻路径，包括低风险高置信结果是否可跳过或简化 LLM 证据评估、figure/profile 补充检索策略是否更窄，以及 `retrieval_strategy`、`query_refinement`、`image_selection`、`llm_call_counts` 是否能单独解释这两类 route 的成本变化。
 
 ## 默认基础服务配置
 
