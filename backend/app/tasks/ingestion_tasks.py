@@ -5,7 +5,9 @@ from backend.app.database import build_database_engine
 from backend.app.parsing.chunker import ParentChildChunker
 from backend.app.parsing.parser import PyMuPDFParser
 from backend.app.providers.embeddings import build_embedding_provider
+from backend.app.providers.llm import build_llm_provider
 from backend.app.repositories.postgres import PgVectorRepository
+from backend.app.services.document_profile import DocumentProfileBuilder
 from backend.app.services.image_store import ObjectImageStore
 from backend.app.services.ingestion import IngestionService
 from backend.app.services.object_storage import build_object_storage
@@ -31,6 +33,7 @@ def ingest_document(
             embedding_provider=build_embedding_provider(settings),
             repository=repository,
             image_store=ObjectImageStore(build_object_storage(settings)),
+            profile_builder=DocumentProfileBuilder(llm_provider=_build_optional_profile_llm_provider(settings)),
         )
         try:
             chunk_count = service.ingest(document_id, Path(file_path), filename=filename, file_hash=file_hash, file_size=file_size)
@@ -41,3 +44,12 @@ def ingest_document(
         return chunk_count
     finally:
         engine.dispose()
+
+
+def _build_optional_profile_llm_provider(settings):
+    if not settings.llm_profile_extraction_enabled:
+        return None
+    try:
+        return build_llm_provider(settings)
+    except Exception:
+        return None

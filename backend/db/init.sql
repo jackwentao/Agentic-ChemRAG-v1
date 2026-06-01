@@ -110,10 +110,25 @@ CREATE TABLE IF NOT EXISTS document_profiles (
     document_id TEXT PRIMARY KEY,
     title TEXT,
     abstract TEXT,
+    conclusion TEXT,
     summary_text TEXT NOT NULL,
     topics JSONB NOT NULL DEFAULT '[]'::jsonb,
     entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+    profile_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    outline_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb,
     figure_summary TEXT,
+    embedding VECTOR(1024),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS document_profile_embeddings (
+    profile_field_id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    field_name TEXT NOT NULL,
+    field_text TEXT NOT NULL,
+    source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     embedding VECTOR(1024),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -168,6 +183,9 @@ ON images (document_id, page);
 
 CREATE INDEX IF NOT EXISTS figures_document_page_idx
 ON figures (document_id, page);
+
+CREATE INDEX IF NOT EXISTS document_profile_embeddings_document_idx
+ON document_profile_embeddings (document_id, field_name);
 
 CREATE INDEX IF NOT EXISTS chat_sessions_owner_updated_idx
 ON chat_sessions (owner_id, updated_at DESC);

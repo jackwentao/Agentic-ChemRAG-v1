@@ -1,9 +1,10 @@
 import json
+from dataclasses import asdict
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from backend.app.domain.documents import Chunk, DocumentProfile, Evidence, EvidenceImage, StoredImage
+from backend.app.domain.documents import Chunk, DocumentProfile, DocumentProfileField, Evidence, EvidenceImage, SourceRef, StoredImage
 
 
 class PgVectorRepository:
@@ -479,6 +480,18 @@ class PgVectorRepository:
                     score=float(figure["score"] or 0),
                     image_ids=[image.image_id],
                     images=[image],
+                    evidence_type="figure",
+                    source_scope="page_span",
+                    source_refs=[
+                        SourceRef(
+                            source_type="figure_caption",
+                            page_start=page,
+                            page_end=page,
+                            section_title="Figure Index",
+                            field_name="caption",
+                            text=text_value[:500],
+                        )
+                    ],
                 )
             )
         return evidence
@@ -489,20 +502,26 @@ class PgVectorRepository:
                 text(
                     """
                     INSERT INTO document_profiles (
-                        document_id, title, abstract, summary_text, topics, entities,
-                        figure_summary, embedding, updated_at
+                        document_id, title, abstract, conclusion, summary_text, topics, entities,
+                        profile_json, outline_json, source_refs_json, figure_summary, embedding, updated_at
                     )
                     VALUES (
-                        :document_id, :title, :abstract, :summary_text,
+                        :document_id, :title, :abstract, :conclusion, :summary_text,
                         CAST(:topics AS jsonb), CAST(:entities AS jsonb),
+                        CAST(:profile_json AS jsonb), CAST(:outline_json AS jsonb),
+                        CAST(:source_refs_json AS jsonb),
                         :figure_summary, :embedding, now()
                     )
                     ON CONFLICT (document_id) DO UPDATE SET
                         title = EXCLUDED.title,
                         abstract = EXCLUDED.abstract,
+                        conclusion = EXCLUDED.conclusion,
                         summary_text = EXCLUDED.summary_text,
                         topics = EXCLUDED.topics,
                         entities = EXCLUDED.entities,
+                        profile_json = EXCLUDED.profile_json,
+                        outline_json = EXCLUDED.outline_json,
+                        source_refs_json = EXCLUDED.source_refs_json,
                         figure_summary = EXCLUDED.figure_summary,
                         embedding = EXCLUDED.embedding,
                         updated_at = now()
@@ -512,13 +531,60 @@ class PgVectorRepository:
                     "document_id": profile.document_id,
                     "title": profile.title,
                     "abstract": profile.abstract,
+                    "conclusion": profile.conclusion,
                     "summary_text": profile.summary_text,
                     "topics": json.dumps(profile.topics, ensure_ascii=False),
                     "entities": json.dumps(profile.entities, ensure_ascii=False),
+                    "profile_json": json.dumps(_profile_payload(profile), ensure_ascii=False),
+                    "outline_json": json.dumps([asdict(section) for section in profile.outline], ensure_ascii=False),
+                    "source_refs_json": json.dumps([asdict(ref) for ref in profile.source_refs], ensure_ascii=False),
                     "figure_summary": profile.figure_summary,
                     "embedding": self._vector_literal(embedding),
                 },
             )
+
+    def upsert_document_profile_fields(
+        self,
+        document_id: str,
+        fields: list[DocumentProfileField],
+        embeddings: list[list[float]],
+    ) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM document_profile_embeddings WHERE document_id = :document_id"),
+                {"document_id": document_id},
+            )
+            for field, embedding in zip(fields, embeddings, strict=True):
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO document_profile_embeddings (
+                            profile_field_id, document_id, field_name, field_text,
+                            source_refs_json, metadata_json, embedding, updated_at
+                        )
+                        VALUES (
+                            :profile_field_id, :document_id, :field_name, :field_text,
+                            CAST(:source_refs_json AS jsonb), CAST(:metadata_json AS jsonb),
+                            :embedding, now()
+                        )
+                        ON CONFLICT (profile_field_id) DO UPDATE SET
+                            field_text = EXCLUDED.field_text,
+                            source_refs_json = EXCLUDED.source_refs_json,
+                            metadata_json = EXCLUDED.metadata_json,
+                            embedding = EXCLUDED.embedding,
+                            updated_at = now()
+                        """
+                    ),
+                    {
+                        "profile_field_id": _profile_field_id(field.document_id, field.field_name),
+                        "document_id": field.document_id,
+                        "field_name": field.field_name,
+                        "field_text": field.text,
+                        "source_refs_json": json.dumps([asdict(ref) for ref in field.source_refs], ensure_ascii=False),
+                        "metadata_json": json.dumps(field.metadata, ensure_ascii=False),
+                        "embedding": self._vector_literal(embedding),
+                    },
+                )
 
     def search_document_profiles(
         self,
@@ -526,10 +592,14 @@ class PgVectorRepository:
         top_k: int = 5,
         document_ids: list[str] | None = None,
     ) -> list[Evidence]:
+        field_evidence = self.search_document_profile_fields(query_embedding, top_k=top_k, document_ids=document_ids)
+        if field_evidence:
+            return field_evidence
         filters = "AND document_id = ANY(:document_ids)" if document_ids else ""
         sql = text(
             f"""
-            SELECT document_id, title, abstract, summary_text, topics, entities, figure_summary,
+            SELECT document_id, title, abstract, conclusion, summary_text, topics, entities,
+                   profile_json, outline_json, source_refs_json, figure_summary,
                    1 - (embedding <=> :query_embedding) AS score
             FROM document_profiles
             WHERE embedding IS NOT NULL {filters}
@@ -548,6 +618,7 @@ class PgVectorRepository:
             profile = dict(row)
             text_value = str(profile.get("summary_text") or "")
             title = str(profile.get("title") or "Document Profile")
+            source_refs = _source_refs_from_profile_row(profile)
             evidence.append(
                 Evidence(
                     chunk_id=f"profile:{profile['document_id']}",
@@ -559,9 +630,154 @@ class PgVectorRepository:
                     score=float(profile["score"] or 0),
                     image_ids=[],
                     images=[],
+                    evidence_type="document_profile",
+                    source_scope="document_level",
+                    source_refs=source_refs,
+                    metadata={
+                        "title": profile.get("title"),
+                        "abstract": profile.get("abstract"),
+                        "conclusion": profile.get("conclusion"),
+                        "topics": _json_value(profile.get("topics"), []),
+                        "entities": _json_value(profile.get("entities"), []),
+                        "figure_summary": profile.get("figure_summary"),
+                        "outline": _json_value(profile.get("outline_json"), []),
+                        "profile": _json_value(profile.get("profile_json"), {}),
+                    },
+                )
+            )
+        return evidence
+
+    def search_document_profile_fields(
+        self,
+        query_embedding: list[float],
+        top_k: int = 5,
+        document_ids: list[str] | None = None,
+        field_names: list[str] | None = None,
+    ) -> list[Evidence]:
+        filters = []
+        params = {"query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
+        if document_ids:
+            filters.append("document_id = ANY(:document_ids)")
+            params["document_ids"] = document_ids
+        if field_names:
+            filters.append("field_name = ANY(:field_names)")
+            params["field_names"] = field_names
+        where = " AND ".join(["embedding IS NOT NULL", *filters])
+        sql = text(
+            f"""
+            SELECT profile_field_id, document_id, field_name, field_text,
+                   source_refs_json, metadata_json,
+                   1 - (embedding <=> :query_embedding) AS score
+            FROM document_profile_embeddings
+            WHERE {where}
+            ORDER BY embedding <=> :query_embedding
+            LIMIT :top_k
+            """
+        )
+        with self.engine.begin() as conn:
+            rows = conn.execute(sql, params).mappings().all()
+
+        evidence: list[Evidence] = []
+        for row in rows:
+            field = dict(row)
+            field_name = str(field.get("field_name") or "profile_field")
+            metadata = _json_value(field.get("metadata_json"), {})
+            evidence.append(
+                Evidence(
+                    chunk_id=f"profile:{field['document_id']}:{field_name}",
+                    document_id=str(field["document_id"]),
+                    text=str(field.get("field_text") or ""),
+                    page_start=1,
+                    page_end=1,
+                    section_title=f"Document Profile / {field_name}",
+                    score=float(field["score"] or 0),
+                    evidence_type="document_profile",
+                    source_scope="document_level",
+                    source_refs=_source_refs_from_json(field.get("source_refs_json"), fallback_text=str(field.get("field_text") or "")),
+                    metadata={
+                        **(metadata if isinstance(metadata, dict) else {}),
+                        "profile_field": field_name,
+                    },
                 )
             )
         return evidence
 
     def _vector_literal(self, vector: list[float]) -> str:
         return "[" + ",".join(f"{value:.8f}" for value in vector) + "]"
+
+
+def _profile_payload(profile: DocumentProfile) -> dict[str, object]:
+    return {
+        "document_id": profile.document_id,
+        "title": profile.title,
+        "abstract": profile.abstract,
+        "conclusion": profile.conclusion,
+        "topics": profile.topics,
+        "entities": profile.entities,
+        "typed_entities": [asdict(entity) for entity in profile.typed_entities],
+        "key_findings": profile.key_findings,
+        "methods": profile.methods,
+        "properties": profile.properties,
+        "applications": profile.applications,
+        "limitations": profile.limitations,
+        "extraction_method": profile.extraction_method,
+        "extraction_warnings": profile.extraction_warnings,
+    }
+
+
+def _profile_field_id(document_id: str, field_name: str) -> str:
+    return f"{document_id}:{field_name}"
+
+
+def _source_refs_from_profile_row(profile: dict) -> list[SourceRef]:
+    return _source_refs_from_json(profile.get("source_refs_json"), fallback_text=str(profile.get("summary_text") or ""))
+
+
+def _source_refs_from_json(value, fallback_text: str) -> list[SourceRef]:
+    raw_refs = _json_value(value, [])
+    refs: list[SourceRef] = []
+    if isinstance(raw_refs, list):
+        for raw_ref in raw_refs:
+            if not isinstance(raw_ref, dict):
+                continue
+            refs.append(
+                SourceRef(
+                    source_type=str(raw_ref.get("source_type") or "profile_field"),
+                    page_start=_optional_int(raw_ref.get("page_start")),
+                    page_end=_optional_int(raw_ref.get("page_end")),
+                    section_title=_optional_str(raw_ref.get("section_title")),
+                    field_name=_optional_str(raw_ref.get("field_name")),
+                    text=_optional_str(raw_ref.get("text")),
+                )
+            )
+    if refs:
+        return refs
+    return [
+        SourceRef(
+            source_type="generated_profile",
+            field_name="summary_text",
+            text=fallback_text[:500],
+        )
+    ]
+
+
+def _json_value(value, default):
+    if value is None:
+        return default
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return default
+    return value
+
+
+def _optional_str(value) -> str | None:
+    return None if value is None else str(value)
+
+
+def _optional_int(value) -> int | None:
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None

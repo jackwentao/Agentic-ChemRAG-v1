@@ -129,6 +129,7 @@ def test_source_url_validation_rejects_missing_or_non_pdf_page_urls():
         [{"source_url": "/api/documents/doc1/pdf#page=2"}],
         [{"source_url": "/api/documents/doc1/pdf#page=3"}],
     )
+    assert source_urls_valid([{"source_url": None, "source_scope": "document_level"}], [])
     assert not source_urls_valid([{"source_url": "/api/images/img1"}], [])
     assert not source_urls_valid([], [{"image_id": "img1"}])
 

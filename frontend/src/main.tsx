@@ -10,10 +10,12 @@ type Citation = {
   chunk_id: string;
   page_start: number;
   page_end: number;
-  source_url: string;
+  source_url: string | null;
   section_title: string;
   quote: string;
   score: number;
+  evidence_type: string;
+  source_scope: string;
   image_ids: string[];
   images: CitationImage[];
 };
@@ -437,10 +439,17 @@ function ChatMessageView({ message }: { message: ChatMessage }) {
       {message.citations.map((citation) => (
         <article className="citation" key={citation.chunk_id}>
           <header>
-            <a className="citation-source" href={`${API_BASE}${citation.source_url}`} rel="noreferrer" target="_blank">
-              <strong>{citation.section_title}</strong>
-              <span>p. {citation.page_start}-{citation.page_end}</span>
-            </a>
+            {citation.source_url ? (
+              <a className="citation-source" href={`${API_BASE}${citation.source_url}`} rel="noreferrer" target="_blank">
+                <strong>{citation.section_title}</strong>
+                <span>p. {citation.page_start}-{citation.page_end}</span>
+              </a>
+            ) : (
+              <div className="citation-source">
+                <strong>{citation.section_title}</strong>
+                <span>{citation.source_scope === "document_level" ? "文档画像" : citation.evidence_type}</span>
+              </div>
+            )}
           </header>
           <p>{citation.quote}</p>
           {(citation.images ?? []).length > 0 && (

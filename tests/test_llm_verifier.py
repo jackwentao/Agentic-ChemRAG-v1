@@ -1,10 +1,11 @@
-from backend.app.domain.documents import Evidence
+from backend.app.domain.documents import DocumentSection, Evidence
 from backend.app.domain.rag import TaskDecision
 from backend.app.providers.llm import (
     ComposedLlmProvider,
     DeepSeekLlmProvider,
     FakeLlmProvider,
     _sanitize_answer_verification,
+    _sanitize_document_profile_extraction,
     _sanitize_evidence_assessment,
 )
 
@@ -152,6 +153,57 @@ def test_deepseek_answer_falls_back_to_verified_evidence_when_connection_is_unav
     assert "520 nm" in answer
 
 
+def test_deepseek_profile_extractor_requests_structured_json():
+    provider = DeepSeekLlmProvider.__new__(DeepSeekLlmProvider)
+    provider.model = "test-model"
+    provider.timeout_seconds = 2.0
+    provider.executor = ImmediateExecutor()
+    provider.client = VerificationClient(
+        '{"title":"LLM profile","abstract":"Abstract text.","conclusion":"Conclusion text.",'
+        '"topics":["photoluminescence"],"entities":["ZnO"],"key_findings":["Finding"],'
+        '"methods":["sol-gel"],"properties":["emission"],"applications":["sensing"],'
+        '"limitations":["No long-term test"],'
+        '"source_refs":[{"source_type":"page_text","page_start":1,"page_end":1,'
+        '"field_name":"abstract","text":"Abstract text."}],"reason":"done"}'
+    )
+
+    result = provider.extract_document_profile(
+        document_id="doc1",
+        document_text="Title\nAbstract\nAbstract text.\nConclusions\nConclusion text.",
+        outline=[DocumentSection(title="Abstract", normalized_type="abstract", page_start=1, page_end=1)],
+        figure_captions=["Figure 1. PL spectra."],
+    )
+
+    assert result is not None
+    assert result.extraction_method == "llm"
+    assert result.title == "LLM profile"
+    assert result.entities == ["ZnO"]
+    assert result.key_findings == ["Finding"]
+    assert result.source_refs[0].field_name == "abstract"
+    user_message = provider.client.chat.completions.messages[1]["content"]
+    assert "outline_candidates" in user_message
+    assert "Figure 1. PL spectra." in user_message
+
+
+def test_profile_extraction_sanitizer_limits_invalid_payload_shapes():
+    result = _sanitize_document_profile_extraction(
+        {
+            "title": "A" * 400,
+            "topics": ["ZnO", "ZnO", 3],
+            "entities": ["TiO2"],
+            "source_refs": [{"source_type": "page_text", "page_start": "2", "field_name": "title"}],
+        },
+        document_id="doc2",
+        outline=[],
+    )
+
+    assert result is not None
+    assert len(result.title or "") == 300
+    assert result.topics == ["ZnO"]
+    assert result.entities == ["TiO2"]
+    assert result.source_refs[0].page_start == 2
+
+
 def test_composed_provider_uses_fake_answer_but_real_assessment_delegate():
     assessment_provider = DeepSeekLlmProvider.__new__(DeepSeekLlmProvider)
     assessment_provider.model = "test-model"
@@ -227,8 +279,11 @@ def test_deepseek_answer_verifier_requests_claim_level_json():
     assert result.missing_disclosures == ["缺少长期稳定性"]
     assert result.revision_instruction == "删除安全放大结论并披露稳定性缺口。"
     user_message = provider.client.chat.completions.messages[1]["content"]
+    system_message = provider.client.chat.completions.messages[0]["content"]
     assert "Is this safe to scale-up?" in user_message
     assert "资料缺口：缺少长期稳定性" in user_message
+    assert "evidence_type/source_scope" in system_message
+    assert "document_profile/document_level" in system_message
 
 
 def test_answer_verification_sanitizer_fails_when_issue_lists_are_nonempty():

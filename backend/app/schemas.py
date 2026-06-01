@@ -109,10 +109,12 @@ class Citation(BaseModel):
     chunk_id: str
     page_start: int
     page_end: int
-    source_url: str
+    source_url: str | None
     section_title: str
     quote: str
     score: float
+    evidence_type: str = "chunk"
+    source_scope: str = "page_span"
     image_ids: list[str] = []
     images: list[CitationImage] = []
 
@@ -128,6 +130,16 @@ class RouteDiagnostics(BaseModel):
     lexical_scores: dict[str, float] = Field(default_factory=dict)
     semantic_scores: dict[str, float] = Field(default_factory=dict)
     rationale: list[str] = Field(default_factory=list)
+
+
+class OutlineResolutionDiagnostics(BaseModel):
+    original_question: str = ""
+    rewritten_question: str = ""
+    basic_facts: list[str] = Field(default_factory=list)
+    decision: str = "pass_through"
+    target_document_ids: list[str] = Field(default_factory=list)
+    needs_outline_retrieval: bool = False
+    reason: str = ""
 
 
 class RoutePlanStepDiagnostics(BaseModel):
@@ -297,6 +309,7 @@ class ChatDiagnostics(BaseModel):
     retrieval_rounds: list[RetrievalRoundDiagnostics] = Field(default_factory=list)
     assessment_rounds: list[AssessmentRoundDiagnostics] = Field(default_factory=list)
     llm_call_counts: LlmCallCountsDiagnostics = Field(default_factory=LlmCallCountsDiagnostics)
+    outline_resolution: OutlineResolutionDiagnostics | None = None
     route: RouteDiagnostics | None = None
     route_plan: RoutePlanDiagnostics | None = None
     task: TaskDiagnostics | None = None

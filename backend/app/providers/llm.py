@@ -4,7 +4,7 @@ import json
 import re
 
 from backend.app.config import Settings
-from backend.app.domain.documents import Evidence, EvidenceImage
+from backend.app.domain.documents import DocumentSection, Evidence, EvidenceImage, SourceRef
 from backend.app.domain.rag import (
     AnswerVerification,
     EvidenceAssessment,
@@ -13,6 +13,7 @@ from backend.app.domain.rag import (
     RouteStep,
     TaskDecision,
 )
+from backend.app.services.profile_schema import ProfileExtraction
 
 
 class LlmProvider(ABC):
@@ -25,6 +26,16 @@ class LlmProvider(ABC):
 
     def healthcheck(self) -> None:
         """验证当前 provider 是否能执行其配置的问答能力。"""
+        return None
+
+    def extract_document_profile(
+        self,
+        *,
+        document_id: str,
+        document_text: str,
+        outline: list[DocumentSection],
+        figure_captions: list[str],
+    ) -> ProfileExtraction | None:
         return None
 
     def plan_route(
@@ -198,19 +209,15 @@ class DeepSeekLlmProvider(LlmProvider):
         return _sanitize_route_plan(payload, question)
 
     def answer_with_evidence(self, question: str, evidence: list[Evidence]) -> str:
-        if _is_figure_listing_question(question):
-            quick_answer = _answer_figure_listing_question(evidence)
-            if quick_answer:
-                return quick_answer
-
-        context = "\n\n".join(
-            f"[{idx + 1}] page {item.page_start}-{item.page_end}, {item.section_title}\n{item.text}"
-            for idx, item in enumerate(evidence)
-        )
+        context = "\n\n".join(_format_evidence_for_prompt(idx, item) for idx, item in enumerate(evidence))
         messages = [
             {
                 "role": "system",
-                "content": "You answer chemistry/materials-science questions using only the provided evidence. Cite page numbers when possible.",
+                "content": (
+                    "You answer chemistry/materials-science questions using only the provided evidence. "
+                    "Cite page numbers when evidence has page spans; when evidence is document-level profile data, "
+                    "describe it as document-level profile evidence instead of inventing a page citation."
+                ),
             },
             {"role": "user", "content": f"Question:\n{question}\n\nEvidence:\n{context}"},
         ]
@@ -224,6 +231,62 @@ class DeepSeekLlmProvider(LlmProvider):
             if _is_recoverable_llm_error(exc):
                 return _fallback_answer_with_evidence(question, evidence)
             raise
+
+    def extract_document_profile(
+        self,
+        *,
+        document_id: str,
+        document_text: str,
+        outline: list[DocumentSection],
+        figure_captions: list[str],
+    ) -> ProfileExtraction | None:
+        context = {
+            "document_id": document_id,
+            "outline_candidates": [_document_section_payload(section) for section in outline[:80]],
+            "figure_captions": figure_captions[:40],
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是化学与材料文献的结构化文档画像抽取器。"
+                    "只依据给定论文文本、大纲候选和图题抽取，不得编造。"
+                    "字段缺失时返回 null 或空数组。"
+                    "实体应覆盖材料/化合物/方法/性能/应用/表征技术等开放领域词，而不是只限固定词表。"
+                    "source_refs 用于说明字段来自哪里，尽量填 field_name、source_type、page_start/page_end 和短 text。"
+                    "严格输出 JSON："
+                    '{"title":null或字符串,"abstract":null或字符串,"conclusion":null或字符串,'
+                    '"topics":["..."],"entities":["..."],"key_findings":["..."],'
+                    '"methods":["..."],"properties":["..."],"applications":["..."],'
+                    '"limitations":["..."],"source_refs":[{"source_type":"page_text或figure_caption",'
+                    '"page_start":1,"page_end":1,"section_title":"...","field_name":"abstract","text":"..."}],'
+                    '"reason":"简短说明"}。'
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"抽取上下文：\n{json.dumps(context, ensure_ascii=False)}\n\n"
+                    f"论文文本（可能被截断）：\n{document_text[:12000]}"
+                ),
+            },
+        ]
+        future = self.executor.submit(
+            self.client.chat.completions.create,
+            model=self.model,
+            messages=messages,
+            response_format={"type": "json_object"},
+        )
+        try:
+            response = future.result(timeout=self.timeout_seconds)
+            payload = json.loads(response.choices[0].message.content or "{}")
+        except (FutureTimeoutError, json.JSONDecodeError):
+            return None
+        except Exception as exc:
+            if _is_recoverable_llm_error(exc):
+                return None
+            raise
+        return _sanitize_document_profile_extraction(payload, document_id=document_id, outline=outline)
 
     def assess_evidence(self, question: str, evidence: list[Evidence]) -> EvidenceAssessment:
         return self._assess_evidence(question, evidence, task_context=None)
@@ -263,13 +326,7 @@ class DeepSeekLlmProvider(LlmProvider):
             )
 
         candidates = [
-            {
-                "chunk_id": item.chunk_id,
-                "document_id": item.document_id,
-                "pages": f"{item.page_start}-{item.page_end}",
-                "section_title": item.section_title,
-                "text": item.text[:2400],
-            }
+            _evidence_candidate(item, text_limit=2400)
             for item in valid_evidence
         ]
         messages = [
@@ -392,13 +449,7 @@ class DeepSeekLlmProvider(LlmProvider):
         trigger_reasons: list[str],
     ) -> AnswerVerification:
         candidates = [
-            {
-                "chunk_id": item.chunk_id,
-                "document_id": item.document_id,
-                "pages": f"{item.page_start}-{item.page_end}",
-                "section_title": item.section_title,
-                "text": item.text[:1800],
-            }
+            _evidence_candidate(item, text_limit=1800)
             for item in evidence
         ]
         context = {
@@ -421,6 +472,10 @@ class DeepSeekLlmProvider(LlmProvider):
                     "你是化学与材料文献问答系统的答案核验器。"
                     "只检查最终答案是否被给定证据直接支撑，不要重新回答问题。"
                     "找出未支撑断言、遗漏的资料限制、引用或证据对应错误、以及超过证据强度的表述。"
+                    "证据强度需要按 evidence_type/source_scope 区分：chunk/page_span 是原文页级证据；"
+                    "document_profile/document_level 是结构化画像或字段级画像，适合概括、定位和筛选，"
+                    "但若答案包含具体数值、实验条件、机制解释或强结论，应检查是否需要原文 chunk 支撑；"
+                    "figure 证据主要来自图题或图片索引，解释图中机制/结论时需检查是否有 caption 或原文支持。"
                     "高风险问题必须更保守：不能允许可执行实验步骤、放大建议或安全结论超出证据。"
                     "如果需要修改，给出 revision_instruction；不要输出新答案。"
                     "严格输出 JSON："
@@ -465,10 +520,7 @@ class DeepSeekLlmProvider(LlmProvider):
         limitations: list[str],
         revision_instruction: str,
     ) -> str:
-        context = "\n\n".join(
-            f"[{idx + 1}] page {item.page_start}-{item.page_end}, {item.section_title}\n{item.text[:1800]}"
-            for idx, item in enumerate(evidence)
-        )
+        context = "\n\n".join(_format_evidence_for_prompt(idx, item, text_limit=1800) for idx, item in enumerate(evidence))
         messages = [
             {
                 "role": "system",
@@ -638,11 +690,38 @@ class FakeLlmProvider(LlmProvider):
             reason="测试 provider 将非空检索证据视为充分。",
         )
 
+    def extract_document_profile(
+        self,
+        *,
+        document_id: str,
+        document_text: str,
+        outline: list[DocumentSection],
+        figure_captions: list[str],
+    ) -> ProfileExtraction | None:
+        first_line = next((line.strip() for line in document_text.splitlines() if line.strip()), None)
+        return ProfileExtraction(
+            document_id=document_id,
+            title=first_line[:300] if first_line else None,
+            topics=["fake_llm_profile"],
+            entities=[],
+            figure_summary="\n".join(figure_captions[:3]) or None,
+            outline=outline,
+            source_refs=[
+                SourceRef(
+                    source_type="generated_profile",
+                    field_name="title",
+                    text=(first_line or "")[:300],
+                )
+            ] if first_line else [],
+            extraction_method="llm",
+        )
+
     def answer_with_evidence(self, question: str, evidence: list[Evidence]) -> str:
         if not evidence:
             return f"I could not find enough evidence to answer: {question}"
-        pages = ", ".join(str(item.page_start) for item in evidence)
-        return f"Based on the retrieved evidence on page(s) {pages}, this is a grounded draft answer to: {question}"
+        locations = ", ".join(_evidence_location(item) for item in evidence)
+        snippets = " | ".join(re.sub(r"\s+", " ", item.text).strip()[:160] for item in evidence[:3])
+        return f"Based on the retrieved evidence ({locations}), this is a grounded draft answer to: {question}. Evidence: {snippets}"
 
     def select_images_for_answer(
         self,
@@ -722,6 +801,21 @@ class ComposedLlmProvider(LlmProvider):
         self.answer_provider.healthcheck()
         if self.assessment_provider is not self.answer_provider:
             self.assessment_provider.healthcheck()
+
+    def extract_document_profile(
+        self,
+        *,
+        document_id: str,
+        document_text: str,
+        outline: list[DocumentSection],
+        figure_captions: list[str],
+    ) -> ProfileExtraction | None:
+        return self.answer_provider.extract_document_profile(
+            document_id=document_id,
+            document_text=document_text,
+            outline=outline,
+            figure_captions=figure_captions,
+        )
 
     def plan_route(
         self,
@@ -880,6 +974,32 @@ def _sanitize_route_plan(payload: object, question: str) -> RoutePlan | None:
     )
 
 
+def _sanitize_document_profile_extraction(
+    payload: object,
+    *,
+    document_id: str,
+    outline: list[DocumentSection],
+) -> ProfileExtraction | None:
+    if not isinstance(payload, dict):
+        return None
+    return ProfileExtraction(
+        document_id=document_id,
+        title=_sanitize_optional_text(payload.get("title"), max_chars=300),
+        abstract=_sanitize_optional_text(payload.get("abstract"), max_chars=1600),
+        conclusion=_sanitize_optional_text(payload.get("conclusion"), max_chars=1600),
+        topics=_sanitize_string_list(payload.get("topics"), limit=20),
+        entities=_sanitize_string_list(payload.get("entities"), limit=40),
+        key_findings=_sanitize_string_list(payload.get("key_findings"), limit=12),
+        methods=_sanitize_string_list(payload.get("methods"), limit=12),
+        properties=_sanitize_string_list(payload.get("properties"), limit=12),
+        applications=_sanitize_string_list(payload.get("applications"), limit=12),
+        limitations=_sanitize_string_list(payload.get("limitations"), limit=12),
+        outline=outline,
+        source_refs=_sanitize_source_refs(payload.get("source_refs")),
+        extraction_method="llm",
+    )
+
+
 def _sanitize_evidence_assessment(payload: object, evidence: list[Evidence]) -> EvidenceAssessment:
     if not isinstance(payload, dict):
         return _fallback_evidence_assessment(evidence, "证据评估返回结构无效，已保留候选证据。")
@@ -979,6 +1099,40 @@ def _sanitize_string_list(value: object, limit: int = 12) -> list[str]:
         return []
     values = [str(item).strip()[:240] for item in value if isinstance(item, str) and item.strip()]
     return list(dict.fromkeys(values))[:limit]
+
+
+def _sanitize_optional_text(value: object, max_chars: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text_value = re.sub(r"\s+", " ", value).strip()
+    return text_value[:max_chars] if text_value else None
+
+
+def _sanitize_source_refs(value: object) -> list[SourceRef]:
+    if not isinstance(value, list):
+        return []
+    refs: list[SourceRef] = []
+    for item in value[:40]:
+        if not isinstance(item, dict):
+            continue
+        refs.append(
+            SourceRef(
+                source_type=str(item.get("source_type") or "generated_profile")[:80],
+                page_start=_optional_int(item.get("page_start")),
+                page_end=_optional_int(item.get("page_end")),
+                section_title=_sanitize_optional_text(item.get("section_title"), max_chars=160),
+                field_name=_sanitize_optional_text(item.get("field_name"), max_chars=80),
+                text=_sanitize_optional_text(item.get("text"), max_chars=500),
+            )
+        )
+    return refs
+
+
+def _optional_int(value: object) -> int | None:
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _sanitize_confidence(value: object) -> float | None:
@@ -1101,6 +1255,60 @@ def _meaningful_terms(text: str) -> set[str]:
     return terms
 
 
+def _document_section_payload(section: DocumentSection) -> dict[str, object]:
+    return {
+        "title": section.title,
+        "normalized_type": section.normalized_type,
+        "page_start": section.page_start,
+        "page_end": section.page_end,
+        "summary": section.summary,
+        "keywords": section.keywords,
+        "linked_figures": section.linked_figures,
+    }
+
+
+def _evidence_location(item: Evidence) -> str:
+    if item.source_scope == "document_level" or item.evidence_type == "document_profile":
+        return "document-level profile"
+    return f"page {item.page_start}-{item.page_end}"
+
+
+def _source_ref_payload(item: Evidence) -> list[dict[str, object]]:
+    return [
+        {
+            "source_type": ref.source_type,
+            "page_start": ref.page_start,
+            "page_end": ref.page_end,
+            "section_title": ref.section_title,
+            "field_name": ref.field_name,
+            "text": ref.text,
+        }
+        for ref in item.source_refs
+    ]
+
+
+def _evidence_candidate(item: Evidence, text_limit: int) -> dict[str, object]:
+    return {
+        "chunk_id": item.chunk_id,
+        "document_id": item.document_id,
+        "evidence_type": item.evidence_type,
+        "source_scope": item.source_scope,
+        "location": _evidence_location(item),
+        "pages": None if item.source_scope == "document_level" else f"{item.page_start}-{item.page_end}",
+        "section_title": item.section_title,
+        "source_refs": _source_ref_payload(item),
+        "text": item.text[:text_limit],
+    }
+
+
+def _format_evidence_for_prompt(index: int, item: Evidence, text_limit: int | None = None) -> str:
+    text = item.text if text_limit is None else item.text[:text_limit]
+    return (
+        f"[{index + 1}] {item.evidence_type}, {_evidence_location(item)}, {item.section_title}\n"
+        f"{text}"
+    )
+
+
 def _fallback_answer_with_evidence(question: str, evidence: list[Evidence]) -> str:
     if not evidence:
         return f"未检索到足够证据回答：{question}"
@@ -1109,7 +1317,7 @@ def _fallback_answer_with_evidence(question: str, evidence: list[Evidence]) -> s
     ]
     for index, item in enumerate(evidence[:3], start=1):
         snippet = re.sub(r"\s+", " ", item.text).strip()[:260]
-        lines.append(f"[{index}] p. {item.page_start}-{item.page_end}，{item.section_title}：{snippet}")
+        lines.append(f"[{index}] {_evidence_location(item)}，{item.section_title}：{snippet}")
     return "\n".join(lines)
 
 

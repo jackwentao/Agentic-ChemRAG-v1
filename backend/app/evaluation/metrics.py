@@ -155,7 +155,11 @@ def selected_figure_hit(
 
 
 def source_urls_valid(citations: list[dict[str, Any]], selected_images: list[dict[str, Any]]) -> bool:
-    urls = [citation.get("source_url") for citation in citations]
+    urls = [
+        citation.get("source_url")
+        for citation in citations
+        if not (citation.get("source_scope") == "document_level" and citation.get("source_url") is None)
+    ]
     urls.extend(image.get("source_url") for image in selected_images)
     return all(isinstance(url, str) and PDF_SOURCE_URL_PATTERN.match(url) for url in urls)
 

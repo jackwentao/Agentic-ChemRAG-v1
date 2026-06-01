@@ -1,4 +1,4 @@
-from backend.app.domain.documents import DocumentProfile, StoredImage
+from backend.app.domain.documents import DocumentProfile, DocumentProfileField, StoredImage
 from backend.app.database import prepare_database
 from backend.app.repositories.postgres import PgVectorRepository
 
@@ -38,6 +38,8 @@ class FakeConnection:
             return FakeResult(self.engine.figure_rows)
         if "FROM document_profiles" in sql and "ORDER BY embedding" in sql:
             return FakeResult(self.engine.profile_rows)
+        if "FROM document_profile_embeddings" in sql and "ORDER BY embedding" in sql:
+            return FakeResult(self.engine.profile_field_rows)
         return FakeResult()
 
 
@@ -47,6 +49,7 @@ class FakeEngine:
         self.search_rows = []
         self.figure_rows = []
         self.profile_rows = []
+        self.profile_field_rows = []
 
     def begin(self):
         return FakeConnection(self)
@@ -62,6 +65,7 @@ def test_prepare_database_adds_image_metadata_columns():
     assert "ALTER TABLE images ADD COLUMN IF NOT EXISTS nearby_text TEXT" in statements
     assert "CREATE TABLE IF NOT EXISTS figures" in statements
     assert "CREATE TABLE IF NOT EXISTS document_profiles" in statements
+    assert "CREATE TABLE IF NOT EXISTS document_profile_embeddings" in statements
     assert "CREATE INDEX IF NOT EXISTS figures_embedding_idx" in statements
     assert "CREATE INDEX IF NOT EXISTS document_profiles_embedding_idx" not in statements
     assert "DROP INDEX IF EXISTS document_profiles_embedding_idx" in statements
@@ -190,9 +194,13 @@ def test_pgvector_repository_vector_searches_do_not_disable_index_scans():
             "document_id": "doc1",
             "title": "Photocatalyst profile",
             "abstract": None,
+            "conclusion": None,
             "summary_text": "Summary for photocatalyst document.",
             "topics": [],
             "entities": [],
+            "profile_json": {},
+            "outline_json": [],
+            "source_refs_json": [],
             "figure_summary": None,
             "score": 0.87,
         }
@@ -216,9 +224,13 @@ def test_pgvector_repository_upserts_and_searches_document_profile():
             "document_id": "doc1",
             "title": "Photocatalyst profile",
             "abstract": "Abstract text.",
+            "conclusion": "Conclusion text.",
             "summary_text": "Document level summary.",
             "topics": ["photocatalysis"],
             "entities": ["TiO2"],
+            "profile_json": {"conclusion": "Conclusion text."},
+            "outline_json": [],
+            "source_refs_json": [],
             "figure_summary": "Figure summary.",
             "score": 0.82,
         }
@@ -230,6 +242,7 @@ def test_pgvector_repository_upserts_and_searches_document_profile():
             document_id="doc1",
             title="Photocatalyst profile",
             abstract="Abstract text.",
+            conclusion="Conclusion text.",
             summary_text="Document level summary.",
             topics=["photocatalysis"],
             entities=["TiO2"],
@@ -240,7 +253,50 @@ def test_pgvector_repository_upserts_and_searches_document_profile():
     evidence = repository.search_document_profiles([0.1, 0.2], top_k=1)
 
     assert engine.calls[0][1]["document_id"] == "doc1"
+    assert engine.calls[0][1]["conclusion"] == "Conclusion text."
     assert engine.calls[0][1]["topics"] == '["photocatalysis"]'
     assert engine.calls[0][1]["entities"] == '["TiO2"]'
+    assert "outline_json" in engine.calls[0][1]
     assert evidence[0].chunk_id == "profile:doc1"
     assert evidence[0].section_title == "Photocatalyst profile"
+    assert evidence[0].evidence_type == "document_profile"
+    assert evidence[0].source_scope == "document_level"
+    assert evidence[0].metadata["conclusion"] == "Conclusion text."
+
+
+def test_pgvector_repository_upserts_and_searches_document_profile_fields():
+    engine = FakeEngine()
+    engine.profile_field_rows = [
+        {
+            "profile_field_id": "doc1:properties",
+            "document_id": "doc1",
+            "field_name": "properties",
+            "field_text": "photoluminescence emission intensity",
+            "source_refs_json": [],
+            "metadata_json": {"profile_title": "Photocatalyst profile"},
+            "score": 0.91,
+        }
+    ]
+    repository = PgVectorRepository(engine)
+
+    repository.upsert_document_profile_fields(
+        "doc1",
+        [
+            DocumentProfileField(
+                document_id="doc1",
+                field_name="properties",
+                text="photoluminescence emission intensity",
+                metadata={"profile_title": "Photocatalyst profile"},
+            )
+        ],
+        [[0.1, 0.2]],
+    )
+    evidence = repository.search_document_profiles([0.1, 0.2], top_k=1)
+
+    statements = "\n".join(sql for sql, _params in engine.calls)
+    assert "DELETE FROM document_profile_embeddings" in statements
+    assert "INSERT INTO document_profile_embeddings" in statements
+    assert evidence[0].chunk_id == "profile:doc1:properties"
+    assert evidence[0].evidence_type == "document_profile"
+    assert evidence[0].source_scope == "document_level"
+    assert evidence[0].metadata["profile_field"] == "properties"

@@ -204,10 +204,12 @@ def _build_citations(evidence, selected_images) -> list[Citation]:
             chunk_id=item.chunk_id,
             page_start=item.page_start,
             page_end=item.page_end,
-            source_url=pdf_page_url(item.document_id, item.page_start),
+            source_url=None if item.source_scope == "document_level" else pdf_page_url(item.document_id, item.page_start),
             section_title=item.section_title,
             quote=item.text[:500],
             score=item.score,
+            evidence_type=item.evidence_type,
+            source_scope=item.source_scope,
             image_ids=[image.image_id for image in selected_images.get(item.chunk_id, [])],
             images=[
                 CitationImage(

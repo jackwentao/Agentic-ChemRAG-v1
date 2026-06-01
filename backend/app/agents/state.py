@@ -2,6 +2,7 @@ from typing import TypedDict
 
 from backend.app.domain.documents import Evidence, EvidenceImage
 from backend.app.domain.rag import AnswerVerification, EvidenceAssessment, QueryPlan, RoutePlan, StopReason, TaskDecision
+from backend.app.retrieval.outline_resolution import OutlineReferenceResolution
 
 
 class RagGraphState(TypedDict, total=False):
@@ -13,6 +14,7 @@ class RagGraphState(TypedDict, total=False):
     conversation_context: str | None
     document_ids: list[str] | None
     scope: str | None
+    outline_resolution: OutlineReferenceResolution | None
     task_decision: TaskDecision | None
     route_plan: RoutePlan | None
     current_step_index: int

@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-v4-flash"
     deepseek_timeout_seconds: float = 25.0
     llm_image_selection_enabled: bool = False
+    llm_profile_extraction_enabled: bool = True
 
     embedding_provider: str = "local_bge_m3"
     embedding_model: str = "BAAI/bge-m3"

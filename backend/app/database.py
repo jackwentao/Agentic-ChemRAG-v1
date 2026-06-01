@@ -65,9 +65,13 @@ def prepare_database(engine: Engine) -> None:
                     document_id TEXT PRIMARY KEY,
                     title TEXT,
                     abstract TEXT,
+                    conclusion TEXT,
                     summary_text TEXT NOT NULL,
                     topics JSONB NOT NULL DEFAULT '[]'::jsonb,
                     entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    profile_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    outline_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                     figure_summary TEXT,
                     embedding VECTOR(1024),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -75,6 +79,27 @@ def prepare_database(engine: Engine) -> None:
                 """
             )
         )
+        conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS conclusion TEXT"))
+        conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS profile_json JSONB NOT NULL DEFAULT '{}'::jsonb"))
+        conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS outline_json JSONB NOT NULL DEFAULT '[]'::jsonb"))
+        conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS document_profile_embeddings (
+                    profile_field_id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    field_text TEXT NOT NULL,
+                    source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    embedding VECTOR(1024),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+        conn.execute(text("CREATE INDEX IF NOT EXISTS document_profile_embeddings_document_idx ON document_profile_embeddings (document_id, field_name)"))
         conn.execute(
             text(
                 """

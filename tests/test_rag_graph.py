@@ -7,6 +7,18 @@ from backend.app.repositories.memory import InMemoryVectorRepository
 from backend.app.services.rag import RetrievalService
 
 
+class CountingAnswerProvider(FakeLlmProvider):
+    def __init__(self) -> None:
+        self.answer_calls = 0
+
+    def uses_llm_for_answer(self) -> bool:
+        return True
+
+    def answer_with_evidence(self, question: str, evidence: list[Evidence]) -> str:
+        self.answer_calls += 1
+        return super().answer_with_evidence(question, evidence)
+
+
 def test_multi_agent_rag_graph_returns_answer_and_evidence():
     embedding_provider = FakeEmbeddingProvider(dimensions=8)
     repository = InMemoryVectorRepository()
@@ -490,6 +502,8 @@ class FigureIndexRepository:
                         caption="Figure 1. Photoluminescence spectra.",
                     )
                 ],
+                evidence_type="figure",
+                source_scope="page_span",
             )
         ]
 
@@ -509,8 +523,25 @@ def test_multi_agent_rag_graph_routes_figure_questions_to_figure_index():
     assert state["diagnostics"]["llm"]["selected_image_count"] == 1
 
 
+def test_multi_agent_rag_graph_uses_unified_answerer_for_figure_index():
+    embedding_provider = FakeEmbeddingProvider(dimensions=8)
+    provider = CountingAnswerProvider()
+    graph = MultiAgentRagGraph(RetrievalService(FigureIndexRepository(), embedding_provider), provider)
+
+    state = graph.invoke("该文献有什么性能图？")
+
+    assert state["route"] == "figure_index"
+    assert provider.answer_calls == 1
+    assert state["diagnostics"]["llm"]["used_llm"] is True
+    assert state["diagnostics"]["llm_call_counts"]["answer_generation"] == 1
+
+
 class DocumentProfileRepository:
+    def __init__(self) -> None:
+        self.document_ids = None
+
     def search_document_profiles(self, query_embedding, top_k=5, document_ids=None):
+        self.document_ids = document_ids
         return [
             Evidence(
                 chunk_id="profile:d1",
@@ -520,13 +551,16 @@ class DocumentProfileRepository:
                 page_end=1,
                 section_title="Porphyrin polymer",
                 score=0.93,
+                evidence_type="document_profile",
+                source_scope="document_level",
             )
         ]
 
 
 def test_multi_agent_rag_graph_routes_holistic_questions_to_document_profiles():
     embedding_provider = FakeEmbeddingProvider(dimensions=8)
-    graph = MultiAgentRagGraph(RetrievalService(DocumentProfileRepository(), embedding_provider), FakeLlmProvider())
+    repository = DocumentProfileRepository()
+    graph = MultiAgentRagGraph(RetrievalService(repository, embedding_provider), FakeLlmProvider())
 
     state = graph.invoke("哪些论文是讲卟啉相关的？", scope="all_documents")
 
@@ -535,6 +569,34 @@ def test_multi_agent_rag_graph_routes_holistic_questions_to_document_profiles():
     assert "cross_document_signal" in state["route_rationale"]
     assert state["verified_evidence"][0].chunk_id == "profile:d1"
     assert state["diagnostics"]["route"]["selected_route"] == "document_profile"
+    assert state["diagnostics"]["outline_resolution"]["decision"] == "enter_outline_retrieval"
+
+
+def test_multi_agent_rag_graph_resolves_pronoun_before_document_profile_retrieval():
+    embedding_provider = FakeEmbeddingProvider(dimensions=8)
+    repository = DocumentProfileRepository()
+    graph = MultiAgentRagGraph(RetrievalService(repository, embedding_provider), FakeLlmProvider())
+
+    state = graph.invoke("它主要研究什么？", document_ids=["d1"], scope="current_document")
+
+    assert state["route"] == "document_profile"
+    assert repository.document_ids == ["d1"]
+    assert state["diagnostics"]["outline_resolution"]["decision"] == "single_document_outline"
+    assert state["diagnostics"]["outline_resolution"]["needs_outline_retrieval"] is False
+    assert "文档 d1" in state["query_plans"][0].resolved_question
+
+
+def test_multi_agent_rag_graph_uses_unified_answerer_for_document_profiles():
+    embedding_provider = FakeEmbeddingProvider(dimensions=8)
+    provider = CountingAnswerProvider()
+    graph = MultiAgentRagGraph(RetrievalService(DocumentProfileRepository(), embedding_provider), provider)
+
+    state = graph.invoke("哪些论文是讲卟啉相关的？", scope="all_documents")
+
+    assert state["route"] == "document_profile"
+    assert provider.answer_calls == 1
+    assert state["diagnostics"]["llm"]["used_llm"] is True
+    assert state["diagnostics"]["llm_call_counts"]["answer_generation"] == 1
 
 
 class PlannedProfileFigureProvider(FakeLlmProvider):
@@ -562,6 +624,126 @@ class PlannedProfileFigureProvider(FakeLlmProvider):
                 ),
             ],
         )
+
+
+class PlannedProfileOnlyProvider(FakeLlmProvider):
+    def plan_route(self, question: str, *, conversation_context: str | None, scope: str, document_ids: list[str] | None):
+        return RoutePlan(
+            plan_type="single_step",
+            rationale="先用文档画像定位候选论文。",
+            used_llm=True,
+            steps=[
+                RouteStep(
+                    step_id="step-1",
+                    route="document_profile",
+                    task_type="cross_document_filter",
+                    query="ZnO photoluminescence",
+                    purpose="定位相关论文",
+                    max_rounds=1,
+                ),
+            ],
+        )
+
+
+class ProfileGuidedChunkRepository:
+    def __init__(self) -> None:
+        self.profile_queries = 0
+        self.chunk_queries = 0
+        self.chunk_document_ids = None
+
+    def search_document_profiles(self, query_embedding, top_k=5, document_ids=None):
+        self.profile_queries += 1
+        return [
+            Evidence(
+                chunk_id="profile:d1",
+                document_id="d1",
+                text="Title: ZnO photoluminescence. Entities: ZnO. Topics: photoluminescence.",
+                page_start=1,
+                page_end=1,
+                section_title="ZnO photoluminescence",
+                score=0.91,
+                evidence_type="document_profile",
+                source_scope="document_level",
+                metadata={"entities": ["ZnO"], "topics": ["photoluminescence"]},
+            )
+        ]
+
+    def search(self, query_embedding, top_k=5, document_ids=None):
+        self.chunk_queries += 1
+        self.chunk_document_ids = document_ids
+        return [
+            Evidence(
+                chunk_id="c1",
+                document_id="d1",
+                text="The Results section reports green photoluminescence emission from ZnO samples.",
+                page_start=4,
+                page_end=4,
+                section_title="Results",
+                score=0.88,
+            )
+        ]
+
+
+def test_profile_guided_retrieval_adds_constrained_chunk_followup_for_detail_questions():
+    repository = ProfileGuidedChunkRepository()
+    graph = MultiAgentRagGraph(
+        RetrievalService(repository, FakeEmbeddingProvider(dimensions=8)),
+        PlannedProfileOnlyProvider(),
+    )
+
+    state = graph.invoke("Which papers discuss ZnO photoluminescence and what evidence do they provide?", scope="all_documents")
+
+    assert repository.profile_queries == 1
+    assert repository.chunk_queries == 1
+    assert repository.chunk_document_ids == ["d1"]
+    assert [step["route"] for step in state["completed_route_steps"]] == ["document_profile", "chunk_search"]
+    assert [item.chunk_id for item in state["verified_evidence"]] == ["profile:d1", "c1"]
+    assert state["route_plan"].plan_type == "profile_guided"
+    assert state["diagnostics"]["profile_guided_followup"]["route"] == "chunk_search"
+    assert state["diagnostics"]["profile_guided_followup"]["document_ids"] == ["d1"]
+
+
+class ProfileGuidedFigureRepository(ProfileGuidedChunkRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.figure_queries = 0
+        self.figure_document_ids = None
+
+    def search_figures(self, query_embedding, top_k=8, document_ids=None):
+        self.figure_queries += 1
+        self.figure_document_ids = document_ids
+        return [
+            Evidence(
+                chunk_id="figure:img1",
+                document_id="d1",
+                text="Figure 2. PL spectra of ZnO samples.",
+                page_start=5,
+                page_end=5,
+                section_title="Figure Index",
+                score=0.9,
+                image_ids=["img1"],
+                images=[EvidenceImage(image_id="img1", page=5, label="Figure 2", caption="Figure 2. PL spectra.")],
+                evidence_type="figure",
+            )
+        ]
+
+
+def test_profile_guided_retrieval_adds_constrained_figure_followup_for_figure_questions():
+    repository = ProfileGuidedFigureRepository()
+    graph = MultiAgentRagGraph(
+        RetrievalService(repository, FakeEmbeddingProvider(dimensions=8)),
+        PlannedProfileOnlyProvider(),
+    )
+
+    state = graph.invoke("Which indexed paper discusses ZnO and which PL spectrum figure supports it?", scope="all_documents")
+
+    assert repository.profile_queries == 1
+    assert repository.figure_queries == 1
+    assert repository.figure_document_ids == ["d1"]
+    assert repository.chunk_queries == 0
+    assert [step["route"] for step in state["completed_route_steps"]] == ["document_profile", "figure_index"]
+    assert state["selected_images"]["figure:img1"][0].image_id == "img1"
+    assert state["diagnostics"]["profile_guided_followup"]["route"] == "figure_index"
 
 
 class ProfileAndFigureRepository:

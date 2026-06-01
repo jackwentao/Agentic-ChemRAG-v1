@@ -29,6 +29,11 @@ from backend.app.retrieval.refinement import (
     normalized_query,
     refinement_diagnostics,
 )
+from backend.app.retrieval.outline_resolution import (
+    OutlineReferenceResolver,
+    outline_resolution_diagnostics,
+)
+from backend.app.retrieval.profile_guided import ProfileGuidedRetrievalPlanner
 from backend.app.routing.query_router import QueryRouter, RouteContext
 from backend.app.routing.answer_verification import AnswerVerificationPolicy
 from backend.app.routing.task_policy import BudgetPolicy, TaskClassifier, assessment_requirements
@@ -51,6 +56,8 @@ class MultiAgentRagGraph:
         strategy_selector: RetrievalStrategySelector | None = None,
         query_refiner: HybridQueryRefiner | None = None,
         image_selection_service: ImageSelectionService | None = None,
+        profile_guided_planner: ProfileGuidedRetrievalPlanner | None = None,
+        outline_reference_resolver: OutlineReferenceResolver | None = None,
     ) -> None:
         self.retrieval_service = retrieval_service
         self.llm_provider = llm_provider
@@ -63,6 +70,8 @@ class MultiAgentRagGraph:
         self.answer_verification_policy = answer_verification_policy or AnswerVerificationPolicy()
         self.strategy_selector = strategy_selector or RetrievalStrategySelector()
         self.image_selection_service = image_selection_service or ImageSelectionService(llm_provider)
+        self.profile_guided_planner = profile_guided_planner or ProfileGuidedRetrievalPlanner()
+        self.outline_reference_resolver = outline_reference_resolver or OutlineReferenceResolver()
         self.query_refiner = query_refiner or HybridQueryRefiner(
             RuleQueryRefiner(),
             LlmQueryRefiner(llm_provider),
@@ -88,6 +97,7 @@ class MultiAgentRagGraph:
                 "conversation_context": conversation_context,
                 "document_ids": document_ids,
                 "scope": scope,
+                "outline_resolution": None,
                 "query_plans": [
                     QueryPlan(
                         original_question=question,
@@ -180,18 +190,35 @@ class MultiAgentRagGraph:
         # planner 先尝试让 LLM 输出有界 route_plan；失败时回退到规则路由。
         # 单步问题会被规范化为只有一个 step 的 route_plan，兼容旧执行链路。
         started_at = perf_counter()
-        context = RouteContext(
-            scope=state.get("scope") or ("current_document" if state.get("document_ids") else "all_documents"),
-            document_ids=state.get("document_ids"),
-        )
-        contextual_question = _build_contextual_question(state["question"], state.get("conversation_context"))
-        decision = self.query_router.route(contextual_question, context)
-        route_plan = self.llm_provider.plan_route(
-            state["question"],
+        resolution = self.outline_reference_resolver.resolve(
+            question=state["question"],
             conversation_context=state.get("conversation_context"),
-            scope=context.scope,
             document_ids=state.get("document_ids"),
+            scope=state.get("scope"),
         )
+        effective_document_ids = resolution.target_document_ids if resolution.target_document_ids is not None else state.get("document_ids")
+        effective_scope = "current_document" if resolution.decision == "single_document_outline" else (
+            state.get("scope") or ("current_document" if effective_document_ids else "all_documents")
+        )
+        context = RouteContext(
+            scope=effective_scope,
+            document_ids=effective_document_ids,
+        )
+        contextual_question = _build_contextual_question(resolution.rewritten_question, state.get("conversation_context"))
+        decision = self.query_router.route(contextual_question, context)
+        if resolution.decision == "single_document_outline":
+            route_plan = _route_plan_from_rule_decision(
+                "document_profile",
+                resolution.rewritten_question,
+                [resolution.reason],
+            )
+        else:
+            route_plan = self.llm_provider.plan_route(
+                resolution.rewritten_question,
+                conversation_context=state.get("conversation_context"),
+                scope=context.scope,
+                document_ids=effective_document_ids,
+            )
         if route_plan is None:
             route_plan = _route_plan_from_rule_decision(decision.route, contextual_question, decision.rationale)
         first_step = route_plan.steps[0]
@@ -210,9 +237,13 @@ class MultiAgentRagGraph:
                 rationale=[*decision.rationale, *([f"llm_plan:{route_plan.rationale}"] if route_plan.used_llm and route_plan.rationale else [])],
             ),
             "route_plan": _route_plan_diagnostics(route_plan, current_step_index=0, completed_steps=[]),
+            "outline_resolution": outline_resolution_diagnostics(resolution),
         }
         return {
             **state,
+            "outline_resolution": resolution,
+            "document_ids": effective_document_ids,
+            "scope": effective_scope,
             "route": first_step.route,
             "route_plan": route_plan,
             "current_step_index": 0,
@@ -569,6 +600,76 @@ class MultiAgentRagGraph:
                 "plan_verified_evidence": plan_verified,
                 "diagnostics": diagnostics,
             }
+        followup = self.profile_guided_planner.plan(
+            question=_build_contextual_question(state["original_question"], state.get("conversation_context")),
+            task_decision=state.get("task_decision"),
+            profile_evidence=step_verified or state.get("accumulated_evidence", []) or state.get("evidence", []),
+        ) if state.get("route") == "document_profile" else None
+        if route_plan and followup:
+            next_step = RouteStep(
+                step_id=f"profile-followup-{next_index + 1}",
+                route=followup.route,
+                task_type="profile_guided_detail",
+                query=followup.query,
+                purpose=followup.reason,
+                max_rounds=1,
+            )
+            guided_plan = RoutePlan(
+                steps=[*route_plan.steps, next_step],
+                plan_type="profile_guided",
+                rationale=route_plan.rationale or "profile 命中文档后补充文档内细节证据。",
+                used_llm=route_plan.used_llm,
+                fallback_used=route_plan.fallback_used,
+            )
+            guided_completed_steps = completed_steps
+            guided_diagnostics = {
+                **diagnostics,
+                "route_plan": _route_plan_diagnostics(
+                    guided_plan,
+                    current_step_index=next_index,
+                    completed_steps=guided_completed_steps,
+                ),
+                "profile_guided_followup": {
+                    "route": followup.route,
+                    "query": followup.query,
+                    "document_ids": followup.document_ids,
+                    "reason": followup.reason,
+                },
+            }
+            return {
+                **state,
+                "route": next_step.route,
+                "plan": _plan_for_route(next_step.route),
+                "route_plan": guided_plan,
+                "current_step_index": next_index,
+                "current_query": next_step.query,
+                "document_ids": followup.document_ids,
+                "query_plans": [
+                    *state.get("query_plans", []),
+                    QueryPlan(
+                        original_question=state["original_question"],
+                        resolved_question=next_step.query,
+                        queries=[next_step.query],
+                        search_goal=next_step.purpose or _plan_for_route(next_step.route),
+                        round_index=1,
+                    ),
+                ],
+                "retrieval_round": 1,
+                "max_retrieval_rounds": 1,
+                "continue_retrieval": False,
+                "step_has_assessment": False,
+                "stop_reason": None,
+                "evidence": [],
+                "accumulated_evidence": [],
+                "verified_evidence": [],
+                "current_new_evidence_count": 0,
+                "limitations": [],
+                "warnings": [],
+                "completed_route_steps": guided_completed_steps,
+                "plan_verified_evidence": plan_verified,
+                "is_multi_step": True,
+                "diagnostics": guided_diagnostics,
+            }
         return {
             **state,
             "current_step_index": next_index,
@@ -620,88 +721,7 @@ class MultiAgentRagGraph:
                 "llm_call_counts": llm_call_counts,
                 "diagnostics": diagnostics,
             }
-        route_plan = state.get("route_plan")
-        if route_plan and len(route_plan.steps) > 1:
-            used_llm = self.llm_provider.uses_llm_for_answer()
-            answer = (
-                self.llm_provider.answer_with_evidence(
-                    _build_contextual_question(state["question"], state.get("conversation_context")),
-                    state.get("verified_evidence", []),
-                )
-                if used_llm
-                else _answer_from_route_plan(route_plan, state.get("completed_route_steps", []), state.get("verified_evidence", []))
-            )
-            latency_ms = (perf_counter() - started_at) * 1000
-            llm_call_counts = increment_llm_call_count(state.get("llm_call_counts"), "answer_generation", used_llm)
-            diagnostics = {
-                **state.get("diagnostics", {}),
-                "llm_call_counts": llm_call_counts,
-                "llm": build_llm_diagnostics(
-                    latency_ms=latency_ms,
-                    used_llm=used_llm,
-                    answer_chars=len(answer),
-                    evidence_count=len(state.get("verified_evidence", [])),
-                    citation_count=len(state.get("verified_evidence", [])),
-                ),
-            }
-            return {
-                **state,
-                "answer": answer,
-                "answer_latency_ms": latency_ms,
-                "llm_call_counts": llm_call_counts,
-                "diagnostics": diagnostics,
-            }
-        used_llm = (
-            state.get("route") not in {"figure_index", "document_profile"}
-            and self.llm_provider.uses_llm_for_answer()
-        )
-        if state.get("route") == "figure_index":
-            answer = _answer_from_figure_index(state.get("verified_evidence", []))
-            latency_ms = (perf_counter() - started_at) * 1000
-            llm_call_counts = increment_llm_call_count(state.get("llm_call_counts"), "answer_generation", used_llm)
-            diagnostics = {
-                **state.get("diagnostics", {}),
-                "llm_call_counts": llm_call_counts,
-                "llm": build_llm_diagnostics(
-                    latency_ms=latency_ms,
-                    used_llm=used_llm,
-                    answer_chars=len(answer),
-                    evidence_count=len(state.get("verified_evidence", [])),
-                    citation_count=len(state.get("verified_evidence", [])),
-                ),
-            }
-            return {
-                **state,
-                "answer": answer,
-                "answer_latency_ms": latency_ms,
-                "llm_call_counts": llm_call_counts,
-                "diagnostics": diagnostics,
-            }
-        if state.get("route") == "document_profile":
-            answer = _answer_from_document_profiles(
-                _build_contextual_question(state["question"], state.get("conversation_context")),
-                state.get("verified_evidence", []),
-            )
-            latency_ms = (perf_counter() - started_at) * 1000
-            llm_call_counts = increment_llm_call_count(state.get("llm_call_counts"), "answer_generation", used_llm)
-            diagnostics = {
-                **state.get("diagnostics", {}),
-                "llm_call_counts": llm_call_counts,
-                "llm": build_llm_diagnostics(
-                    latency_ms=latency_ms,
-                    used_llm=used_llm,
-                    answer_chars=len(answer),
-                    evidence_count=len(state.get("verified_evidence", [])),
-                    citation_count=len(state.get("verified_evidence", [])),
-                ),
-            }
-            return {
-                **state,
-                "answer": answer,
-                "answer_latency_ms": latency_ms,
-                "llm_call_counts": llm_call_counts,
-                "diagnostics": diagnostics,
-            }
+        used_llm = self.llm_provider.uses_llm_for_answer()
         answer = self.llm_provider.answer_with_evidence(
             _build_contextual_question(state["question"], state.get("conversation_context")),
             state.get("verified_evidence", []),
@@ -1012,24 +1032,6 @@ def _merge_verified_evidence(existing: list[Evidence], current: list[Evidence]) 
     return merged
 
 
-def _answer_from_route_plan(
-    route_plan: RoutePlan,
-    completed_steps: list[dict[str, object]],
-    evidence: list[Evidence],
-) -> str:
-    lines = ["根据多步骤检索计划，当前可支撑的结果如下："]
-    for step in completed_steps:
-        route = step.get("route", "")
-        query = step.get("query", "")
-        verified_count = step.get("verified_evidence_count", 0)
-        lines.append(f"- {route}: `{query}`，获得 {verified_count} 条可引用证据。")
-    for index, item in enumerate(evidence[:8], start=1):
-        prefix = "图像证据" if item.images else "文本证据"
-        snippet = " ".join(item.text.split())[:240]
-        lines.append(f"{index}. {prefix} p. {item.page_start}: {snippet}")
-    return "\n".join(lines)
-
-
 def _build_contextual_question(question: str, conversation_context: str | None) -> str:
     context = (conversation_context or "").strip()
     if not context:
@@ -1039,29 +1041,6 @@ def _build_contextual_question(question: str, conversation_context: str | None) 
         f"{context}\n\n"
         f"当前问题：{question}"
     )
-
-
-def _answer_from_figure_index(evidence: list[Evidence]) -> str:
-    if not evidence:
-        return "没有在 figure 索引中找到足够相关的图片或图题。"
-    lines = ["根据 figure 索引，最相关的图包括："]
-    for index, item in enumerate(evidence[:8], start=1):
-        image = item.images[0] if item.images else None
-        label = image.label if image and image.label else ""
-        caption = image.caption if image and image.caption else item.text
-        lines.append(f"{index}. p. {item.page_start}: {label} {caption}".strip())
-    return "\n".join(lines)
-
-
-def _answer_from_document_profiles(question: str, evidence: list[Evidence]) -> str:
-    if not evidence:
-        return f"没有检索到足够的文档画像证据来回答：{question}"
-    lines = ["根据文档画像，相关论文要点如下："]
-    for index, item in enumerate(evidence[:5], start=1):
-        title = item.section_title or "Document Profile"
-        snippet = " ".join(item.text.split())[:700]
-        lines.append(f"{index}. {title} (p. {item.page_start}): {snippet}")
-    return "\n".join(lines)
 
 
 def _with_selected_image_count(
