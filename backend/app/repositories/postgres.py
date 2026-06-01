@@ -1,6 +1,7 @@
 import json
 from dataclasses import asdict
 
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
@@ -22,21 +23,25 @@ class PgVectorRepository:
                     text(
                         """
                         INSERT INTO chunks (
-                            chunk_id, document_id, parent_id, text, page_start, page_end,
+                            chunk_id, document_id, owner_id, parent_id, text, page_start, page_end,
                             section_title, section_path, chunk_type, embedding
                         )
                         VALUES (
-                            :chunk_id, :document_id, :parent_id, :text, :page_start, :page_end,
+                            :chunk_id, :document_id,
+                            COALESCE(:owner_id, (SELECT owner_id FROM documents WHERE document_id = :document_id), 'demo'),
+                            :parent_id, :text, :page_start, :page_end,
                             :section_title, :section_path, :chunk_type, :embedding
                         )
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             text = EXCLUDED.text,
+                            owner_id = EXCLUDED.owner_id,
                             embedding = EXCLUDED.embedding
                         """
                     ),
                     {
                         "chunk_id": chunk.chunk_id,
                         "document_id": chunk.document_id,
+                        "owner_id": chunk.owner_id,
                         "parent_id": chunk.parent_id,
                         "text": chunk.text,
                         "page_start": chunk.page_start,
@@ -373,8 +378,68 @@ class PgVectorRepository:
             ).scalars().all()
         return [str(row) for row in rows]
 
-    def search(self, query_embedding: list[float], top_k: int = 5, document_ids: list[str] | None = None) -> list[Evidence]:
-        filters = "AND document_id = ANY(:document_ids)" if document_ids else ""
+    def count_searchable_chunks(
+        self,
+        document_ids: list[str] | None = None,
+        owner_id: str | None = None,
+    ) -> int:
+        filters, params = _ownership_filters(document_ids=document_ids, owner_id=owner_id)
+        where = " AND ".join(["chunk_type = 'child'", *filters])
+        with self.engine.begin() as conn:
+            count = conn.execute(
+                text(f"SELECT COUNT(*) FROM chunks WHERE {where}"),
+                params,
+            ).scalar_one()
+        return int(count)
+
+    def search(
+        self,
+        query_embedding: list[float],
+        top_k: int = 5,
+        document_ids: list[str] | None = None,
+        owner_id: str | None = None,
+        search_strategy: str = "hnsw",
+        exact_timeout_ms: int | None = None,
+    ) -> list[Evidence]:
+        if search_strategy == "exact_then_hnsw":
+            try:
+                return self._search_chunks(
+                    query_embedding,
+                    top_k=top_k,
+                    document_ids=document_ids,
+                    owner_id=owner_id,
+                    search_strategy="exact",
+                    exact_timeout_ms=exact_timeout_ms,
+                )
+            except DBAPIError:
+                return self._search_chunks(
+                    query_embedding,
+                    top_k=top_k,
+                    document_ids=document_ids,
+                    owner_id=owner_id,
+                    search_strategy="hnsw",
+                    exact_timeout_ms=None,
+                )
+        return self._search_chunks(
+            query_embedding,
+            top_k=top_k,
+            document_ids=document_ids,
+            owner_id=owner_id,
+            search_strategy=search_strategy,
+            exact_timeout_ms=exact_timeout_ms,
+        )
+
+    def _search_chunks(
+        self,
+        query_embedding: list[float],
+        top_k: int,
+        document_ids: list[str] | None,
+        owner_id: str | None,
+        search_strategy: str,
+        exact_timeout_ms: int | None,
+    ) -> list[Evidence]:
+        filter_parts, params = _ownership_filters(document_ids=document_ids, owner_id=owner_id)
+        filters = f"AND {' AND '.join(filter_parts)}" if filter_parts else ""
         sql = text(
             f"""
             WITH ranked AS (
@@ -416,10 +481,16 @@ class PgVectorRepository:
             LIMIT :top_k
             """
         )
-        params = {"query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
-        if document_ids:
-            params["document_ids"] = document_ids
+        params = {**params, "query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
         with self.engine.begin() as conn:
+            if search_strategy == "exact":
+                if exact_timeout_ms:
+                    conn.execute(text("SET LOCAL statement_timeout = :timeout"), {"timeout": f"{int(exact_timeout_ms)}ms"})
+                conn.execute(text("SET LOCAL enable_indexscan = off"))
+                conn.execute(text("SET LOCAL enable_bitmapscan = off"))
+                conn.execute(text("SET LOCAL enable_indexonlyscan = off"))
+            elif search_strategy == "hnsw":
+                conn.execute(text("SET LOCAL enable_seqscan = off"))
             rows = conn.execute(sql, params).mappings().all()
         evidence = []
         for row in rows:
@@ -434,8 +505,17 @@ class PgVectorRepository:
         query_embedding: list[float],
         top_k: int = 8,
         document_ids: list[str] | None = None,
+        owner_id: str | None = None,
     ) -> list[Evidence]:
-        filters = "AND document_id = ANY(:document_ids)" if document_ids else ""
+        filter_parts = []
+        params: dict[str, object] = {}
+        if document_ids:
+            filter_parts.append("document_id = ANY(:document_ids)")
+            params["document_ids"] = document_ids
+        if owner_id:
+            filter_parts.append("document_id IN (SELECT document_id FROM documents WHERE owner_id = :owner_id)")
+            params["owner_id"] = owner_id
+        filters = f"AND {' AND '.join(filter_parts)}" if filter_parts else ""
         sql = text(
             f"""
             SELECT figure_id, image_id, document_id, page, label, caption, nearby_text,
@@ -447,9 +527,7 @@ class PgVectorRepository:
             LIMIT :top_k
             """
         )
-        params = {"query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
-        if document_ids:
-            params["document_ids"] = document_ids
+        params = {**params, "query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
         with self.engine.begin() as conn:
             rows = conn.execute(sql, params).mappings().all()
 
@@ -502,17 +580,20 @@ class PgVectorRepository:
                 text(
                     """
                     INSERT INTO document_profiles (
-                        document_id, title, abstract, conclusion, summary_text, topics, entities,
+                        document_id, owner_id, title, abstract, conclusion, summary_text, topics, entities,
                         profile_json, outline_json, source_refs_json, figure_summary, embedding, updated_at
                     )
                     VALUES (
-                        :document_id, :title, :abstract, :conclusion, :summary_text,
+                        :document_id,
+                        COALESCE(:owner_id, (SELECT owner_id FROM documents WHERE document_id = :document_id), 'demo'),
+                        :title, :abstract, :conclusion, :summary_text,
                         CAST(:topics AS jsonb), CAST(:entities AS jsonb),
                         CAST(:profile_json AS jsonb), CAST(:outline_json AS jsonb),
                         CAST(:source_refs_json AS jsonb),
                         :figure_summary, :embedding, now()
                     )
                     ON CONFLICT (document_id) DO UPDATE SET
+                        owner_id = EXCLUDED.owner_id,
                         title = EXCLUDED.title,
                         abstract = EXCLUDED.abstract,
                         conclusion = EXCLUDED.conclusion,
@@ -529,6 +610,7 @@ class PgVectorRepository:
                 ),
                 {
                     "document_id": profile.document_id,
+                    "owner_id": profile.owner_id,
                     "title": profile.title,
                     "abstract": profile.abstract,
                     "conclusion": profile.conclusion,
@@ -559,15 +641,18 @@ class PgVectorRepository:
                     text(
                         """
                         INSERT INTO document_profile_embeddings (
-                            profile_field_id, document_id, field_name, field_text,
+                            profile_field_id, document_id, owner_id, field_name, field_text,
                             source_refs_json, metadata_json, embedding, updated_at
                         )
                         VALUES (
-                            :profile_field_id, :document_id, :field_name, :field_text,
+                            :profile_field_id, :document_id,
+                            COALESCE(:owner_id, (SELECT owner_id FROM documents WHERE document_id = :document_id), 'demo'),
+                            :field_name, :field_text,
                             CAST(:source_refs_json AS jsonb), CAST(:metadata_json AS jsonb),
                             :embedding, now()
                         )
                         ON CONFLICT (profile_field_id) DO UPDATE SET
+                            owner_id = EXCLUDED.owner_id,
                             field_text = EXCLUDED.field_text,
                             source_refs_json = EXCLUDED.source_refs_json,
                             metadata_json = EXCLUDED.metadata_json,
@@ -578,6 +663,7 @@ class PgVectorRepository:
                     {
                         "profile_field_id": _profile_field_id(field.document_id, field.field_name),
                         "document_id": field.document_id,
+                        "owner_id": field.owner_id,
                         "field_name": field.field_name,
                         "field_text": field.text,
                         "source_refs_json": json.dumps([asdict(ref) for ref in field.source_refs], ensure_ascii=False),
@@ -591,11 +677,18 @@ class PgVectorRepository:
         query_embedding: list[float],
         top_k: int = 5,
         document_ids: list[str] | None = None,
+        owner_id: str | None = None,
     ) -> list[Evidence]:
-        field_evidence = self.search_document_profile_fields(query_embedding, top_k=top_k, document_ids=document_ids)
+        field_evidence = self.search_document_profile_fields(
+            query_embedding,
+            top_k=top_k,
+            document_ids=document_ids,
+            owner_id=owner_id,
+        )
         if field_evidence:
             return field_evidence
-        filters = "AND document_id = ANY(:document_ids)" if document_ids else ""
+        filter_parts, params = _ownership_filters(document_ids=document_ids, owner_id=owner_id)
+        filters = f"AND {' AND '.join(filter_parts)}" if filter_parts else ""
         sql = text(
             f"""
             SELECT document_id, title, abstract, conclusion, summary_text, topics, entities,
@@ -607,9 +700,7 @@ class PgVectorRepository:
             LIMIT :top_k
             """
         )
-        params = {"query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
-        if document_ids:
-            params["document_ids"] = document_ids
+        params = {**params, "query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
         with self.engine.begin() as conn:
             rows = conn.execute(sql, params).mappings().all()
 
@@ -653,12 +744,10 @@ class PgVectorRepository:
         top_k: int = 5,
         document_ids: list[str] | None = None,
         field_names: list[str] | None = None,
+        owner_id: str | None = None,
     ) -> list[Evidence]:
-        filters = []
-        params = {"query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
-        if document_ids:
-            filters.append("document_id = ANY(:document_ids)")
-            params["document_ids"] = document_ids
+        filters, params = _ownership_filters(document_ids=document_ids, owner_id=owner_id)
+        params = {**params, "query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
         if field_names:
             filters.append("field_name = ANY(:field_names)")
             params["field_names"] = field_names
@@ -706,9 +795,26 @@ class PgVectorRepository:
         return "[" + ",".join(f"{value:.8f}" for value in vector) + "]"
 
 
+def _ownership_filters(
+    *,
+    document_ids: list[str] | None,
+    owner_id: str | None,
+) -> tuple[list[str], dict[str, object]]:
+    filters: list[str] = []
+    params: dict[str, object] = {}
+    if document_ids:
+        filters.append("document_id = ANY(:document_ids)")
+        params["document_ids"] = document_ids
+    if owner_id:
+        filters.append("owner_id = :owner_id")
+        params["owner_id"] = owner_id
+    return filters, params
+
+
 def _profile_payload(profile: DocumentProfile) -> dict[str, object]:
     return {
         "document_id": profile.document_id,
+        "owner_id": profile.owner_id,
         "title": profile.title,
         "abstract": profile.abstract,
         "conclusion": profile.conclusion,

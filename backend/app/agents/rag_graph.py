@@ -84,6 +84,7 @@ class MultiAgentRagGraph:
         document_ids: list[str] | None = None,
         scope: str | None = None,
         session_id: str | None = None,
+        owner_id: str | None = "demo",
         conversation_context: str | None = None,
     ) -> RagGraphState:
         # invoke 负责初始化首轮状态，并把执行总耗时回填到 diagnostics。
@@ -94,6 +95,7 @@ class MultiAgentRagGraph:
                 "question": question,
                 "original_question": question,
                 "session_id": session_id,
+                "owner_id": owner_id,
                 "conversation_context": conversation_context,
                 "document_ids": document_ids,
                 "scope": scope,
@@ -117,6 +119,7 @@ class MultiAgentRagGraph:
                 "step_has_assessment": False,
                 "continue_retrieval": False,
                 "stop_reason": None,
+                "outline_context_evidence": [],
                 "accumulated_evidence": [],
                 "retrieval_history": [],
                 "assessment_history": [],
@@ -139,6 +142,8 @@ class MultiAgentRagGraph:
         # planner 负责路由，retriever 负责召回，assessor 负责判断证据是否足够，
         # controller/refiner 决定是否继续检索，answerer/image_selector 负责最终输出。
         graph = StateGraph(RagGraphState)
+        graph.add_node("outline_resolver", self._outline_resolver)
+        graph.add_node("outline_retriever", self._outline_retriever)
         graph.add_node("planner", self._planner)
         graph.add_node("task_classifier", self._task_classifier)
         graph.add_node("budget_policy", self._budget_policy)
@@ -151,6 +156,8 @@ class MultiAgentRagGraph:
         graph.add_node("answer_verifier", self._answer_verifier)
         graph.add_node("answer_reviser", self._answer_reviser)
         graph.add_node("image_selector", self._image_selector)
+        graph.add_edge("outline_resolver", "outline_retriever")
+        graph.add_edge("outline_retriever", "planner")
         graph.add_edge("planner", "task_classifier")
         graph.add_edge("task_classifier", "budget_policy")
         graph.add_edge("budget_policy", "retriever")
@@ -183,13 +190,11 @@ class MultiAgentRagGraph:
         )
         graph.add_edge("answer_reviser", "image_selector")
         graph.add_edge("image_selector", END)
-        graph.set_entry_point("planner")
+        graph.set_entry_point("outline_resolver")
         return graph
 
-    def _planner(self, state: RagGraphState) -> RagGraphState:
-        # planner 先尝试让 LLM 输出有界 route_plan；失败时回退到规则路由。
-        # 单步问题会被规范化为只有一个 step 的 route_plan，兼容旧执行链路。
-        started_at = perf_counter()
+    def _outline_resolver(self, state: RagGraphState) -> RagGraphState:
+        # 问题重写层只负责消解指代、输出 basic_facts 和初步文档范围，不做路由规划。
         resolution = self.outline_reference_resolver.resolve(
             question=state["question"],
             conversation_context=state.get("conversation_context"),
@@ -200,25 +205,89 @@ class MultiAgentRagGraph:
         effective_scope = "current_document" if resolution.decision == "single_document_outline" else (
             state.get("scope") or ("current_document" if effective_document_ids else "all_documents")
         )
+        diagnostics = {
+            **state.get("diagnostics", {}),
+            "outline_resolution": outline_resolution_diagnostics(resolution),
+        }
+        return {
+            **state,
+            "outline_resolution": resolution,
+            "document_ids": effective_document_ids,
+            "scope": effective_scope,
+            "current_query": resolution.rewritten_question,
+            "diagnostics": diagnostics,
+        }
+
+    def _outline_retriever(self, state: RagGraphState) -> RagGraphState:
+        # 大纲检索层发生在 planner 之前：单文档取该文档大纲，多文档先匹配候选论文。
+        resolution = state.get("outline_resolution")
+        if resolution is None or not resolution.needs_outline_retrieval:
+            diagnostics = {
+                **state.get("diagnostics", {}),
+                "outline_context": _outline_context_diagnostics(
+                    injected=False,
+                    evidence=[],
+                    document_ids=state.get("document_ids"),
+                    reason="问题不需要 planner 前置大纲检索。",
+                ),
+            }
+            return {**state, "outline_context_evidence": [], "diagnostics": diagnostics}
+
+        query = _outline_retrieval_query(resolution)
+        top_k = 1 if resolution.decision == "single_document_outline" else self.profile_top_k
+        started_at = perf_counter()
+        evidence = self.retrieval_service.retrieve_document_profiles(
+            query,
+            top_k=top_k,
+            document_ids=state.get("document_ids"),
+            owner_id=state.get("owner_id"),
+        )
+        latency_ms = (perf_counter() - started_at) * 1000
+        matched_document_ids = _document_ids_from_evidence(evidence)
+        effective_document_ids = matched_document_ids or state.get("document_ids")
+        diagnostics = {
+            **state.get("diagnostics", {}),
+            "outline_context": _outline_context_diagnostics(
+                injected=bool(evidence),
+                evidence=evidence,
+                document_ids=effective_document_ids,
+                latency_ms=latency_ms,
+                query=query,
+                reason="planner 前置大纲/画像检索已完成。",
+            ),
+        }
+        return {
+            **state,
+            "document_ids": effective_document_ids,
+            "outline_context_evidence": evidence,
+            "accumulated_evidence": _merge_verified_evidence(state.get("accumulated_evidence", []), evidence),
+            "diagnostics": diagnostics,
+        }
+
+    def _planner(self, state: RagGraphState) -> RagGraphState:
+        # planner 消费问题重写层和大纲检索层产物，输出后续 RAG 执行步骤。
+        started_at = perf_counter()
+        resolution = state.get("outline_resolution")
+        rewritten_question = resolution.rewritten_question if resolution else state["question"]
+        basic_facts = resolution.basic_facts if resolution else []
+        outline_context_evidence = state.get("outline_context_evidence", [])
+        effective_document_ids = state.get("document_ids")
+        effective_scope = state.get("scope") or ("current_document" if effective_document_ids else "all_documents")
         context = RouteContext(
             scope=effective_scope,
             document_ids=effective_document_ids,
         )
-        contextual_question = _build_contextual_question(resolution.rewritten_question, state.get("conversation_context"))
+        contextual_question = _build_contextual_question(rewritten_question, state.get("conversation_context"))
         decision = self.query_router.route(contextual_question, context)
-        if resolution.decision == "single_document_outline":
-            route_plan = _route_plan_from_rule_decision(
-                "document_profile",
-                resolution.rewritten_question,
-                [resolution.reason],
-            )
-        else:
-            route_plan = self.llm_provider.plan_route(
-                resolution.rewritten_question,
-                conversation_context=state.get("conversation_context"),
-                scope=context.scope,
-                document_ids=effective_document_ids,
-            )
+        route_plan = _call_plan_route(
+            self.llm_provider,
+            rewritten_question,
+            conversation_context=state.get("conversation_context"),
+            scope=context.scope,
+            document_ids=effective_document_ids,
+            basic_facts=basic_facts,
+            outline_context=outline_context_evidence,
+        )
         if route_plan is None:
             route_plan = _route_plan_from_rule_decision(decision.route, contextual_question, decision.rationale)
         first_step = route_plan.steps[0]
@@ -237,13 +306,9 @@ class MultiAgentRagGraph:
                 rationale=[*decision.rationale, *([f"llm_plan:{route_plan.rationale}"] if route_plan.used_llm and route_plan.rationale else [])],
             ),
             "route_plan": _route_plan_diagnostics(route_plan, current_step_index=0, completed_steps=[]),
-            "outline_resolution": outline_resolution_diagnostics(resolution),
         }
         return {
             **state,
-            "outline_resolution": resolution,
-            "document_ids": effective_document_ids,
-            "scope": effective_scope,
             "route": first_step.route,
             "route_plan": route_plan,
             "current_step_index": 0,
@@ -287,13 +352,35 @@ class MultiAgentRagGraph:
                 query,
                 top_k=self.figure_top_k,
                 document_ids=state.get("document_ids"),
+                owner_id=state.get("owner_id"),
                 exclude_keys=exclude_keys,
             )
+        elif route == "document_profile" and state.get("outline_context_evidence") and state.get("retrieval_round", 1) == 1:
+            evidence = list(state.get("outline_context_evidence", []))
+            self.retrieval_service.last_recall_diagnostics = {
+                "mode": "document_profile_prefetched",
+                "latency_ms": 0.0,
+                "embedding_latency_ms": 0.0,
+                "search_latency_ms": 0.0,
+                "candidate_count": len(evidence),
+                "returned_count": len(evidence),
+                "hit": bool(evidence),
+            }
+            self.retrieval_service.last_rerank_diagnostics = {
+                "enabled": False,
+                "candidate_count": len(evidence),
+                "returned_count": len(evidence),
+                "new_candidate_count": 0,
+                "excluded_existing_count": 0,
+                "incremental_only": False,
+                "skip_reason": "document_profile_prefetched_before_planner",
+            }
         elif route == "document_profile":
             evidence = self.retrieval_service.retrieve_document_profiles(
                 query,
                 top_k=self.profile_top_k,
                 document_ids=state.get("document_ids"),
+                owner_id=state.get("owner_id"),
                 exclude_keys=exclude_keys,
             )
         else:
@@ -301,6 +388,7 @@ class MultiAgentRagGraph:
                 query,
                 top_k=self.retrieval_top_k,
                 document_ids=state.get("document_ids"),
+                owner_id=state.get("owner_id"),
                 exclude_keys=exclude_keys,
             )
         latency_ms = (perf_counter() - started_at) * 1000
@@ -347,7 +435,14 @@ class MultiAgentRagGraph:
         # assessor 的关键目标不是“总结证据”，而是筛出真正支撑答案的 chunk，
         # 并明确指出当前缺失信息，从而驱动下一轮检索。
         started_at = perf_counter()
-        candidates = [item for item in state.get("accumulated_evidence", []) if item.text.strip()]
+        candidates = [
+            item
+            for item in _merge_verified_evidence(
+                state.get("plan_verified_evidence", []),
+                state.get("accumulated_evidence", []),
+            )
+            if item.text.strip()
+        ]
         decision = state.get("task_decision")
         assessment = self.llm_provider.assess_evidence_for_task(
             _build_contextual_question(state["original_question"], state.get("conversation_context")),
@@ -948,6 +1043,81 @@ def _route_plan_from_rule_decision(route: str, query: str, rationale: list[str])
         rationale=";".join(rationale[:6]),
         fallback_used=True,
     )
+
+
+def _call_plan_route(
+    provider: LlmProvider,
+    question: str,
+    *,
+    conversation_context: str | None,
+    scope: str,
+    document_ids: list[str] | None,
+    basic_facts: list[str],
+    outline_context: list[Evidence],
+) -> RoutePlan | None:
+    # 新 planner 输入包含前置大纲检索结果；兼容旧测试 provider 的窄签名。
+    try:
+        return provider.plan_route(
+            question,
+            conversation_context=conversation_context,
+            scope=scope,
+            document_ids=document_ids,
+            basic_facts=basic_facts,
+            outline_context=outline_context,
+        )
+    except TypeError as exc:
+        if "unexpected keyword" not in str(exc):
+            raise
+        return provider.plan_route(
+            question,
+            conversation_context=conversation_context,
+            scope=scope,
+            document_ids=document_ids,
+        )
+
+
+def _outline_retrieval_query(resolution) -> str:
+    components = [
+        resolution.rewritten_question,
+        " ".join(resolution.basic_facts),
+        "论文大纲 文档画像 摘要 主题 章节 结构 关键词",
+    ]
+    return " ".join(component.strip() for component in components if component and component.strip())[:1000]
+
+
+def _outline_context_diagnostics(
+    *,
+    injected: bool,
+    evidence: list[Evidence],
+    document_ids: list[str] | None,
+    reason: str,
+    latency_ms: float = 0.0,
+    query: str = "",
+) -> dict[str, object]:
+    return {
+        "injected": injected,
+        "evidence_count": len(evidence),
+        "document_ids": document_ids or [],
+        "latency_ms": latency_ms,
+        "query": query,
+        "reason": reason,
+        "evidence": [
+            {
+                "chunk_id": item.chunk_id,
+                "document_id": item.document_id,
+                "section_title": item.section_title,
+                "score": item.score,
+                "evidence_type": item.evidence_type,
+                "source_scope": item.source_scope,
+                "text": item.text[:500],
+            }
+            for item in evidence
+        ],
+    }
+
+
+def _document_ids_from_evidence(evidence: list[Evidence]) -> list[str]:
+    return list(dict.fromkeys(item.document_id for item in evidence if item.document_id))
 
 
 def _task_type_for_route(route: str) -> str:

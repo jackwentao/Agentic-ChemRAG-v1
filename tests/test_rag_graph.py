@@ -582,7 +582,7 @@ def test_multi_agent_rag_graph_resolves_pronoun_before_document_profile_retrieva
     assert state["route"] == "document_profile"
     assert repository.document_ids == ["d1"]
     assert state["diagnostics"]["outline_resolution"]["decision"] == "single_document_outline"
-    assert state["diagnostics"]["outline_resolution"]["needs_outline_retrieval"] is False
+    assert state["diagnostics"]["outline_resolution"]["needs_outline_retrieval"] is True
     assert "文档 d1" in state["query_plans"][0].resolved_question
 
 
@@ -780,6 +780,202 @@ class ProfileAndFigureRepository:
                 images=[EvidenceImage(image_id="img1", page=4, label="Figure 2", caption="Figure 2. PL spectra.")],
             )
         ]
+
+
+class CapturingFigurePlanner(FakeLlmProvider):
+    def __init__(self) -> None:
+        self.basic_facts = None
+        self.outline_context = None
+        self.document_ids = None
+
+    def plan_route(
+        self,
+        question: str,
+        *,
+        conversation_context: str | None,
+        scope: str,
+        document_ids: list[str] | None,
+        basic_facts=None,
+        outline_context=None,
+    ):
+        self.basic_facts = basic_facts
+        self.outline_context = outline_context
+        self.document_ids = document_ids
+        return RoutePlan(
+            plan_type="single_step",
+            rationale="已基于前置大纲信息决定继续找图。",
+            used_llm=True,
+            steps=[
+                RouteStep(
+                    step_id="step-1",
+                    route="figure_index",
+                    task_type="figure_query",
+                    query="查找PL相关谱图",
+                    purpose="定位PL相关图题和图片",
+                    max_rounds=1,
+                ),
+            ],
+        )
+
+
+class OutlineInjectedFigureRepository:
+    def __init__(self) -> None:
+        self.profile_queries = 0
+        self.figure_queries = 0
+
+    def search_document_profiles(self, query_embedding, top_k=5, document_ids=None):
+        self.profile_queries += 1
+        return [
+            Evidence(
+                chunk_id="profile:d1",
+                document_id="d1",
+                text="Title: ZnO photoluminescence materials. Outline: Abstract, Methods, Results, Conclusion.",
+                page_start=1,
+                page_end=1,
+                section_title="ZnO photoluminescence materials",
+                score=0.9,
+                evidence_type="document_profile",
+                source_scope="document_level",
+            )
+        ]
+
+    def search_figures(self, query_embedding, top_k=8, document_ids=None):
+        self.figure_queries += 1
+        return [
+            Evidence(
+                chunk_id="figure:img1",
+                document_id="d1",
+                text="Figure 2. PL spectra of ZnO samples.",
+                page_start=4,
+                page_end=4,
+                section_title="Figure Index",
+                score=0.92,
+                image_ids=["img1"],
+                images=[EvidenceImage(image_id="img1", page=4, label="Figure 2", caption="Figure 2. PL spectra.")],
+                evidence_type="figure",
+            )
+        ]
+
+
+def test_outline_context_is_injected_when_single_paper_question_continues_to_figure_step():
+    repository = OutlineInjectedFigureRepository()
+    planner = CapturingFigurePlanner()
+    graph = MultiAgentRagGraph(
+        RetrievalService(repository, FakeEmbeddingProvider(dimensions=8)),
+        planner,
+    )
+
+    state = graph.invoke("这篇论文主要讲什么？顺便找一下和PL相关的图。", document_ids=["d1"])
+
+    assert repository.profile_queries == 1
+    assert repository.figure_queries == 1
+    assert state["route"] == "figure_index"
+    assert state["diagnostics"]["outline_context"]["injected"] is True
+    assert state["diagnostics"]["outline_context"]["document_ids"] == ["d1"]
+    assert planner.document_ids == ["d1"]
+    assert planner.outline_context[0].chunk_id == "profile:d1"
+    assert any("用户问题包含论文指代" in fact for fact in planner.basic_facts)
+    assert [item.chunk_id for item in state["verified_evidence"]] == ["profile:d1", "figure:img1"]
+    assert state["completed_route_steps"][0]["route"] == "figure_index"
+
+
+class CapturingChunkPlanner(FakeLlmProvider):
+    def __init__(self) -> None:
+        self.outline_context = None
+        self.document_ids = None
+
+    def plan_route(
+        self,
+        question: str,
+        *,
+        conversation_context: str | None,
+        scope: str,
+        document_ids: list[str] | None,
+        basic_facts=None,
+        outline_context=None,
+    ):
+        self.outline_context = outline_context
+        self.document_ids = document_ids
+        return RoutePlan(
+            plan_type="single_step",
+            rationale="先由大纲候选论文收窄，再查正文证据。",
+            used_llm=True,
+            steps=[
+                RouteStep(
+                    step_id="step-1",
+                    route="chunk_search",
+                    task_type="fact_qa",
+                    query="ZnO photoluminescence evidence",
+                    purpose="检索候选论文中的正文证据",
+                    max_rounds=1,
+                )
+            ],
+        )
+
+
+class MultiDocumentOutlineRepository:
+    def __init__(self) -> None:
+        self.profile_queries = 0
+        self.chunk_document_ids = None
+
+    def search_document_profiles(self, query_embedding, top_k=5, document_ids=None):
+        self.profile_queries += 1
+        return [
+            Evidence(
+                chunk_id="profile:d1",
+                document_id="d1",
+                text="Title: ZnO PL paper. Topics: ZnO photoluminescence.",
+                page_start=1,
+                page_end=1,
+                section_title="ZnO PL paper",
+                score=0.94,
+                evidence_type="document_profile",
+                source_scope="document_level",
+            ),
+            Evidence(
+                chunk_id="profile:d2",
+                document_id="d2",
+                text="Title: ZnO defect paper. Topics: defect photoluminescence.",
+                page_start=1,
+                page_end=1,
+                section_title="ZnO defect paper",
+                score=0.9,
+                evidence_type="document_profile",
+                source_scope="document_level",
+            ),
+        ]
+
+    def search(self, query_embedding, top_k=5, document_ids=None):
+        self.chunk_document_ids = document_ids
+        return [
+            Evidence(
+                chunk_id="c1",
+                document_id="d1",
+                text="The paper reports ZnO green photoluminescence evidence.",
+                page_start=3,
+                page_end=3,
+                section_title="Results",
+                score=0.88,
+            )
+        ]
+
+
+def test_multi_document_outline_matches_candidates_before_planner_and_limits_followup_search():
+    repository = MultiDocumentOutlineRepository()
+    planner = CapturingChunkPlanner()
+    graph = MultiAgentRagGraph(
+        RetrievalService(repository, FakeEmbeddingProvider(dimensions=8)),
+        planner,
+    )
+
+    state = graph.invoke("哪些论文讨论ZnO发光，并给出结果证据？", scope="all_documents")
+
+    assert repository.profile_queries == 1
+    assert planner.document_ids == ["d1", "d2"]
+    assert [item.chunk_id for item in planner.outline_context] == ["profile:d1", "profile:d2"]
+    assert repository.chunk_document_ids == ["d1", "d2"]
+    assert state["diagnostics"]["outline_context"]["evidence_count"] == 2
+    assert state["diagnostics"]["outline_context"]["document_ids"] == ["d1", "d2"]
 
 
 def test_multi_agent_rag_graph_executes_llm_route_plan_steps():

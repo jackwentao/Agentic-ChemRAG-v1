@@ -11,6 +11,7 @@ class RagGraphState(TypedDict, total=False):
     question: str
     original_question: str
     session_id: str | None
+    owner_id: str | None
     conversation_context: str | None
     document_ids: list[str] | None
     scope: str | None
@@ -40,6 +41,7 @@ class RagGraphState(TypedDict, total=False):
     # evidence 表示当前轮检索结果；accumulated_evidence 表示跨轮累积结果。
     # 两者分离后，控制器就能判断“本轮是否新增证据”和“总体证据是否足够回答”。
     evidence: list[Evidence]
+    outline_context_evidence: list[Evidence]
     accumulated_evidence: list[Evidence]
     current_new_evidence_count: int
     retrieval_history: list[dict[str, object]]

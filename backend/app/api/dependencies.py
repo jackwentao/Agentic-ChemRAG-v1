@@ -163,6 +163,8 @@ def get_retrieval_service(
         reranker_chunk_candidates=settings.reranker_chunk_candidates,
         reranker_figure_candidates=settings.reranker_figure_candidates,
         reranker_min_candidates=settings.reranker_min_candidates,
+        exact_chunk_limit=settings.retrieval_exact_chunk_limit,
+        exact_timeout_ms=settings.retrieval_exact_timeout_ms,
     )
 
 

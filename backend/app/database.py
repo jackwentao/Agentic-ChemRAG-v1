@@ -26,6 +26,7 @@ def prepare_database(engine: Engine) -> None:
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS indexed_at TIMESTAMPTZ"))
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS indexing_updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"))
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS pdf_object_key TEXT"))
+        conn.execute(text("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo'"))
         conn.execute(text("ALTER TABLE images ADD COLUMN IF NOT EXISTS label TEXT"))
         conn.execute(text("ALTER TABLE images ADD COLUMN IF NOT EXISTS caption TEXT"))
         conn.execute(text("ALTER TABLE images ADD COLUMN IF NOT EXISTS nearby_text TEXT"))
@@ -80,6 +81,7 @@ def prepare_database(engine: Engine) -> None:
             )
         )
         conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS conclusion TEXT"))
+        conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo'"))
         conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS profile_json JSONB NOT NULL DEFAULT '{}'::jsonb"))
         conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS outline_json JSONB NOT NULL DEFAULT '[]'::jsonb"))
         conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb"))
@@ -99,7 +101,11 @@ def prepare_database(engine: Engine) -> None:
                 """
             )
         )
+        conn.execute(text("ALTER TABLE document_profile_embeddings ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo'"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS document_profile_embeddings_document_idx ON document_profile_embeddings (document_id, field_name)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS chunks_owner_document_idx ON chunks (owner_id, document_id, chunk_type)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS document_profiles_owner_document_idx ON document_profiles (owner_id, document_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS document_profile_embeddings_owner_document_idx ON document_profile_embeddings (owner_id, document_id, field_name)"))
         conn.execute(
             text(
                 """
@@ -157,6 +163,42 @@ def prepare_database(engine: Engine) -> None:
         conn.execute(
             text(
                 """
+                UPDATE chunks
+                SET owner_id = documents.owner_id
+                FROM documents
+                WHERE chunks.document_id = documents.document_id
+                  AND chunks.owner_id = 'demo'
+                  AND documents.owner_id <> 'demo'
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE document_profiles
+                SET owner_id = documents.owner_id
+                FROM documents
+                WHERE document_profiles.document_id = documents.document_id
+                  AND document_profiles.owner_id = 'demo'
+                  AND documents.owner_id <> 'demo'
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE document_profile_embeddings
+                SET owner_id = documents.owner_id
+                FROM documents
+                WHERE document_profile_embeddings.document_id = documents.document_id
+                  AND document_profile_embeddings.owner_id = 'demo'
+                  AND documents.owner_id <> 'demo'
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
                 UPDATE documents
                 SET indexing_status = 'succeeded',
                     indexing_error = NULL,
@@ -179,6 +221,14 @@ def prepare_database(engine: Engine) -> None:
                 CREATE INDEX IF NOT EXISTS figures_embedding_idx
                 ON figures USING ivfflat (embedding vector_cosine_ops)
                 WITH (lists = 100)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw_idx
+                ON chunks USING hnsw (embedding vector_cosine_ops)
                 """
             )
         )

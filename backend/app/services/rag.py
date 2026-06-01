@@ -30,6 +30,8 @@ class RetrievalService:
         reranker_chunk_candidates: int = 10,
         reranker_figure_candidates: int = 10,
         reranker_min_candidates: int = 10,
+        exact_chunk_limit: int = 2000,
+        exact_timeout_ms: int = 300,
     ) -> None:
         self.repository = repository
         self.embedding_provider = embedding_provider
@@ -38,6 +40,8 @@ class RetrievalService:
         self.reranker_chunk_candidates = reranker_chunk_candidates
         self.reranker_figure_candidates = reranker_figure_candidates
         self.reranker_min_candidates = reranker_min_candidates
+        self.exact_chunk_limit = exact_chunk_limit
+        self.exact_timeout_ms = exact_timeout_ms
         self.last_rerank_latency_ms = 0.0
         self.last_rerank_enabled = False
         self.last_recall_diagnostics: dict[str, object] = {}
@@ -48,6 +52,7 @@ class RetrievalService:
         question: str,
         top_k: int = 5,
         document_ids: list[str] | None = None,
+        owner_id: str | None = None,
         exclude_keys: set[tuple[str, str]] | None = None,
     ):
         # 文本块召回主入口：
@@ -88,8 +93,18 @@ class RetrievalService:
         query_embedding = self.embedding_provider.embed_query(question)
         embedding_latency_ms = (perf_counter() - embedding_started_at) * 1000
         candidate_k = max(top_k, self.reranker_chunk_candidates) if self.reranker_enabled else top_k
+        candidate_chunk_count = self._count_searchable_chunks(document_ids=document_ids, owner_id=owner_id)
+        search_strategy = self._chunk_search_strategy(candidate_chunk_count)
         search_started_at = perf_counter()
-        raw_evidence = self.repository.search(query_embedding, candidate_k, document_ids=document_ids)
+        raw_evidence = _call_search(
+            self.repository.search,
+            query_embedding,
+            candidate_k,
+            document_ids=document_ids,
+            owner_id=owner_id,
+            search_strategy=search_strategy,
+            exact_timeout_ms=self.exact_timeout_ms if search_strategy == "exact_then_hnsw" else None,
+        )
         search_latency_ms = (perf_counter() - search_started_at) * 1000
         evidence, excluded_count = _exclude_existing(raw_evidence, exclude_keys)
         selected = (
@@ -118,6 +133,8 @@ class RetrievalService:
             top_score=top_score,
             avg_score=avg_score,
         )
+        self.last_recall_diagnostics["search_strategy"] = search_strategy
+        self.last_recall_diagnostics["candidate_chunk_count"] = candidate_chunk_count
         return selected
 
     def retrieve_figures(
@@ -125,20 +142,27 @@ class RetrievalService:
         question: str,
         top_k: int = 8,
         document_ids: list[str] | None = None,
+        owner_id: str | None = None,
         exclude_keys: set[tuple[str, str]] | None = None,
     ):
         # figure 检索与 chunk 检索共用同一套服务接口，
         # 但在 repository 层拆出 search_figures，便于后续替换为专门的图像索引。
         self._reset_rerank_state()
         if not hasattr(self.repository, "search_figures"):
-            return self.retrieve(question, top_k=top_k, document_ids=document_ids, exclude_keys=exclude_keys)
+            return self.retrieve(question, top_k=top_k, document_ids=document_ids, owner_id=owner_id, exclude_keys=exclude_keys)
         started_at = perf_counter()
         embedding_started_at = perf_counter()
         query_embedding = self.embedding_provider.embed_query(question)
         embedding_latency_ms = (perf_counter() - embedding_started_at) * 1000
         candidate_k = max(top_k, self.reranker_figure_candidates) if self.reranker_enabled else top_k
         search_started_at = perf_counter()
-        raw_evidence = self.repository.search_figures(query_embedding, candidate_k, document_ids=document_ids)
+        raw_evidence = _call_search(
+            self.repository.search_figures,
+            query_embedding,
+            candidate_k,
+            document_ids=document_ids,
+            owner_id=owner_id,
+        )
         search_latency_ms = (perf_counter() - search_started_at) * 1000
         evidence, excluded_count = _exclude_existing(raw_evidence, exclude_keys)
         selected = (
@@ -174,19 +198,26 @@ class RetrievalService:
         question: str,
         top_k: int = 5,
         document_ids: list[str] | None = None,
+        owner_id: str | None = None,
         exclude_keys: set[tuple[str, str]] | None = None,
     ):
         # 文档画像检索更偏“论文级概览”，因此这里暂不做 rerank，
         # 避免把原本就较短的画像描述再做额外改写和排序干预。
         self._reset_rerank_state()
         if not hasattr(self.repository, "search_document_profiles"):
-            return self.retrieve(question, top_k=top_k, document_ids=document_ids, exclude_keys=exclude_keys)
+            return self.retrieve(question, top_k=top_k, document_ids=document_ids, owner_id=owner_id, exclude_keys=exclude_keys)
         started_at = perf_counter()
         embedding_started_at = perf_counter()
         query_embedding = self.embedding_provider.embed_query(question)
         embedding_latency_ms = (perf_counter() - embedding_started_at) * 1000
         search_started_at = perf_counter()
-        raw_evidence = self.repository.search_document_profiles(query_embedding, top_k, document_ids=document_ids)
+        raw_evidence = _call_search(
+            self.repository.search_document_profiles,
+            query_embedding,
+            top_k,
+            document_ids=document_ids,
+            owner_id=owner_id,
+        )
         search_latency_ms = (perf_counter() - search_started_at) * 1000
         evidence, excluded_count = _exclude_existing(raw_evidence, exclude_keys)
         self.last_rerank_diagnostics = build_rerank_diagnostics(
@@ -328,6 +359,39 @@ class RetrievalService:
         self.last_rerank_enabled = False
         self.last_recall_diagnostics = {}
         self.last_rerank_diagnostics = build_rerank_diagnostics(enabled=self.reranker_enabled)
+
+    def _count_searchable_chunks(self, document_ids: list[str] | None, owner_id: str | None) -> int | None:
+        if not hasattr(self.repository, "count_searchable_chunks"):
+            return None
+        try:
+            return int(self.repository.count_searchable_chunks(document_ids=document_ids, owner_id=owner_id))
+        except TypeError:
+            return int(self.repository.count_searchable_chunks(document_ids=document_ids))
+
+    def _chunk_search_strategy(self, candidate_chunk_count: int | None) -> str:
+        if candidate_chunk_count is None:
+            return "hnsw"
+        if candidate_chunk_count <= self.exact_chunk_limit:
+            return "exact_then_hnsw"
+        return "hnsw"
+
+
+def _call_search(search_method, query_embedding, top_k: int, **kwargs):
+    try:
+        return search_method(query_embedding, top_k, **kwargs)
+    except TypeError as exc:
+        if "unexpected keyword" not in str(exc):
+            raise
+        supported = dict(kwargs)
+        for key in ["exact_timeout_ms", "search_strategy", "owner_id"]:
+            supported.pop(key, None)
+            try:
+                return search_method(query_embedding, top_k, **supported)
+            except TypeError as retry_exc:
+                if "unexpected keyword" not in str(retry_exc):
+                    raise
+                exc = retry_exc
+        raise exc
 
 
 def _metadata_adjustment(question: str, item: Evidence, mode: str) -> float:

@@ -53,6 +53,7 @@ def chat(
             document_ids=document_ids,
             scope=request.scope,
             session_id=session.session_id,
+            owner_id=DEFAULT_OWNER_ID,
             conversation_context=conversation_context,
         )
     except TimeoutError as exc:
@@ -181,20 +182,30 @@ def _invoke_graph(
     document_ids: list[str],
     scope: str,
     session_id: str,
+    owner_id: str,
     conversation_context: str,
 ):
+    kwargs = {
+        "document_ids": document_ids,
+        "scope": scope,
+        "session_id": session_id,
+        "owner_id": owner_id,
+        "conversation_context": conversation_context,
+    }
     try:
-        return graph.invoke(
-            question,
-            document_ids=document_ids,
-            scope=scope,
-            session_id=session_id,
-            conversation_context=conversation_context,
-        )
+        return graph.invoke(question, **kwargs)
     except TypeError as exc:
         if "unexpected keyword" not in str(exc):
             raise
-        return graph.invoke(question, document_ids=document_ids, scope=scope)
+        for key in ["owner_id", "session_id", "conversation_context"]:
+            kwargs.pop(key, None)
+            try:
+                return graph.invoke(question, **kwargs)
+            except TypeError as retry_exc:
+                if "unexpected keyword" not in str(retry_exc):
+                    raise
+                exc = retry_exc
+        raise exc
 
 
 def _build_citations(evidence, selected_images) -> list[Citation]:

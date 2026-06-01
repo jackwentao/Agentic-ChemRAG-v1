@@ -66,6 +66,11 @@ def test_prepare_database_adds_image_metadata_columns():
     assert "CREATE TABLE IF NOT EXISTS figures" in statements
     assert "CREATE TABLE IF NOT EXISTS document_profiles" in statements
     assert "CREATE TABLE IF NOT EXISTS document_profile_embeddings" in statements
+    assert "ALTER TABLE chunks ADD COLUMN IF NOT EXISTS owner_id TEXT" in statements
+    assert "ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS owner_id TEXT" in statements
+    assert "ALTER TABLE document_profile_embeddings ADD COLUMN IF NOT EXISTS owner_id TEXT" in statements
+    assert "CREATE INDEX IF NOT EXISTS chunks_owner_document_idx" in statements
+    assert "CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw_idx" in statements
     assert "CREATE INDEX IF NOT EXISTS figures_embedding_idx" in statements
     assert "CREATE INDEX IF NOT EXISTS document_profiles_embedding_idx" not in statements
     assert "DROP INDEX IF EXISTS document_profiles_embedding_idx" in statements
@@ -132,6 +137,42 @@ def test_pgvector_repository_search_returns_image_caption_metadata():
     assert evidence[0].images[0].caption == "Figure 1. PL spectra."
     assert evidence[0].images[0].nearby_text == "Nearby PL discussion."
     assert evidence[0].images[0].label == "Figure 1"
+
+
+def test_pgvector_repository_chunk_search_filters_by_owner_and_can_use_exact_timeout():
+    engine = FakeEngine()
+    engine.search_rows = [
+        {
+            "chunk_id": "c1",
+            "document_id": "doc1",
+            "text": "Photoluminescence increases after doping.",
+            "page_start": 2,
+            "page_end": 2,
+            "section_title": "Results",
+            "score": 0.91,
+            "image_ids": [],
+            "images": [],
+        }
+    ]
+    repository = PgVectorRepository(engine)
+
+    evidence = repository.search(
+        [0.1, 0.2],
+        top_k=1,
+        document_ids=["doc1"],
+        owner_id="tenant-a",
+        search_strategy="exact_then_hnsw",
+        exact_timeout_ms=250,
+    )
+
+    statements = "\n".join(sql for sql, _params in engine.calls)
+    search_params = engine.calls[-1][1]
+    assert evidence[0].chunk_id == "c1"
+    assert "SET LOCAL statement_timeout" in statements
+    assert "SET LOCAL enable_indexscan = off" in statements
+    assert "owner_id = :owner_id" in statements
+    assert search_params["owner_id"] == "tenant-a"
+    assert search_params["document_ids"] == ["doc1"]
 
 
 def test_pgvector_repository_add_figures_and_search_returns_figure_evidence():

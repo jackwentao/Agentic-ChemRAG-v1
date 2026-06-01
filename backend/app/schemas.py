@@ -142,6 +142,16 @@ class OutlineResolutionDiagnostics(BaseModel):
     reason: str = ""
 
 
+class OutlineContextDiagnostics(BaseModel):
+    injected: bool = False
+    evidence_count: int = 0
+    document_ids: list[str] = Field(default_factory=list)
+    latency_ms: float = 0.0
+    query: str = ""
+    reason: str = ""
+    evidence: list[dict[str, object]] = Field(default_factory=list)
+
+
 class RoutePlanStepDiagnostics(BaseModel):
     step_id: str
     route: str
@@ -310,6 +320,7 @@ class ChatDiagnostics(BaseModel):
     assessment_rounds: list[AssessmentRoundDiagnostics] = Field(default_factory=list)
     llm_call_counts: LlmCallCountsDiagnostics = Field(default_factory=LlmCallCountsDiagnostics)
     outline_resolution: OutlineResolutionDiagnostics | None = None
+    outline_context: OutlineContextDiagnostics | None = None
     route: RouteDiagnostics | None = None
     route_plan: RoutePlanDiagnostics | None = None
     task: TaskDiagnostics | None = None

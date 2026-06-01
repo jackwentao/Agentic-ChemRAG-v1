@@ -65,7 +65,7 @@ class OutlineReferenceResolver:
                 basic_facts=basic_facts,
                 decision="single_document_outline",
                 target_document_ids=target_document_ids,
-                needs_outline_retrieval=False,
+                needs_outline_retrieval=True,
                 reason="问题中的论文指代已解析到唯一文档，只需要读取该文档的大纲/画像。",
             )
 

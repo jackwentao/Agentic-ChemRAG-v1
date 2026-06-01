@@ -53,6 +53,7 @@ class Chunk:
     section_title: str
     section_path: str
     chunk_type: str
+    owner_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,7 @@ class DocumentProfile:
     source_refs: list[SourceRef] = field(default_factory=list)
     extraction_method: str = "rule"
     extraction_warnings: list[str] = field(default_factory=list)
+    owner_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -161,3 +163,4 @@ class DocumentProfileField:
     text: str
     source_refs: list[SourceRef] = field(default_factory=list)
     metadata: dict[str, object] = field(default_factory=dict)
+    owner_id: str | None = None

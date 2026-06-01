@@ -45,6 +45,8 @@ class LlmProvider(ABC):
         conversation_context: str | None,
         scope: str,
         document_ids: list[str] | None,
+        basic_facts: list[str] | None = None,
+        outline_context: list[Evidence] | None = None,
     ) -> RoutePlan | None:
         return None
 
@@ -159,11 +161,18 @@ class DeepSeekLlmProvider(LlmProvider):
         conversation_context: str | None,
         scope: str,
         document_ids: list[str] | None,
+        basic_facts: list[str] | None = None,
+        outline_context: list[Evidence] | None = None,
     ) -> RoutePlan | None:
         context = {
             "scope": scope,
             "document_ids": document_ids or [],
             "conversation_context": (conversation_context or "")[:3000],
+            "basic_facts": basic_facts or [],
+            "outline_context": [
+                _evidence_candidate(item, text_limit=1200)
+                for item in (outline_context or [])[:5]
+            ],
             "allowed_routes": ["chunk_search", "figure_index", "document_profile"],
             "max_steps": 3,
         }
@@ -175,6 +184,8 @@ class DeepSeekLlmProvider(LlmProvider):
                     "根据用户问题、会话上下文和文档范围，输出有界 route_plan。"
                     "不要回答问题，只决定检索/处理步骤。"
                     "route 只能取 allowed_routes 中的值；最多 3 步。"
+                    "basic_facts 和 outline_context 是已完成的前置问题重写与大纲/画像检索结果，"
+                    "必须作为规划依据；不要重复做已经由 outline_context 覆盖的论文定位。"
                     "图片、图号、谱图、曲线定位走 figure_index；"
                     "整篇论文摘要、主题、关键词、跨文档找论文走 document_profile；"
                     "数值、实验条件、机制、结论支撑、高风险安全/合成问题走 chunk_search。"
@@ -198,7 +209,7 @@ class DeepSeekLlmProvider(LlmProvider):
             response_format={"type": "json_object"},
         )
         try:
-            response = future.result(timeout=min(self.timeout_seconds, 3))
+            response = future.result(timeout=self.timeout_seconds)
             payload = json.loads(response.choices[0].message.content or "{}")
         except (FutureTimeoutError, json.JSONDecodeError):
             return None
@@ -427,7 +438,7 @@ class DeepSeekLlmProvider(LlmProvider):
             response_format={"type": "json_object"},
         )
         try:
-            response = future.result(timeout=min(self.timeout_seconds, 3))
+            response = future.result(timeout=self.timeout_seconds)
             payload = json.loads(response.choices[0].message.content or "{}")
         except (FutureTimeoutError, json.JSONDecodeError):
             return None
@@ -824,12 +835,16 @@ class ComposedLlmProvider(LlmProvider):
         conversation_context: str | None,
         scope: str,
         document_ids: list[str] | None,
+        basic_facts: list[str] | None = None,
+        outline_context: list[Evidence] | None = None,
     ) -> RoutePlan | None:
         return self.answer_provider.plan_route(
             question,
             conversation_context=conversation_context,
             scope=scope,
             document_ids=document_ids,
+            basic_facts=basic_facts,
+            outline_context=outline_context,
         )
 
     def answer_with_evidence(self, question: str, evidence: list[Evidence]) -> str:

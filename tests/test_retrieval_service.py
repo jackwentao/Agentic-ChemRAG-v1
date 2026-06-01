@@ -40,6 +40,30 @@ class VectorOnlyRepository:
         ]
 
 
+class StrategyRepository:
+    def __init__(self, chunk_count: int) -> None:
+        self.chunk_count = chunk_count
+        self.calls = []
+
+    def count_searchable_chunks(self, document_ids=None, owner_id=None):
+        self.calls.append(("count", document_ids, owner_id))
+        return self.chunk_count
+
+    def search(self, query_embedding, top_k=5, document_ids=None, owner_id=None, search_strategy="hnsw", exact_timeout_ms=None):
+        self.calls.append(("search", document_ids, owner_id, search_strategy, exact_timeout_ms))
+        return [
+            Evidence(
+                chunk_id="c1",
+                document_id="d1",
+                text="ZnO result",
+                page_start=1,
+                page_end=1,
+                section_title="Results",
+                score=0.9,
+            )
+        ]
+
+
 def test_retrieval_service_embeds_before_vector_repository_search():
     repository = VectorOnlyRepository()
     provider = FakeEmbeddingProvider(dimensions=8)
@@ -58,6 +82,41 @@ def test_retrieval_service_passes_document_filter_to_vector_repository():
     RetrievalService(repository, provider, reranker_enabled=False).retrieve("ZnO", document_ids=["doc1"])
 
     assert repository.document_ids == ["doc1"]
+
+
+def test_retrieve_uses_exact_then_hnsw_for_small_owner_scoped_candidate_sets():
+    repository = StrategyRepository(chunk_count=3)
+    service = RetrievalService(
+        repository,
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_enabled=False,
+        exact_chunk_limit=10,
+        exact_timeout_ms=250,
+    )
+
+    results = service.retrieve("ZnO", document_ids=["doc1"], owner_id="tenant-a")
+
+    assert results[0].chunk_id == "c1"
+    assert repository.calls[0] == ("count", ["doc1"], "tenant-a")
+    assert repository.calls[1] == ("search", ["doc1"], "tenant-a", "exact_then_hnsw", 250)
+    assert service.last_recall_diagnostics["search_strategy"] == "exact_then_hnsw"
+    assert service.last_recall_diagnostics["candidate_chunk_count"] == 3
+
+
+def test_retrieve_uses_hnsw_for_large_owner_scoped_candidate_sets():
+    repository = StrategyRepository(chunk_count=50)
+    service = RetrievalService(
+        repository,
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_enabled=False,
+        exact_chunk_limit=10,
+        exact_timeout_ms=250,
+    )
+
+    service.retrieve("ZnO", document_ids=["doc1"], owner_id="tenant-a")
+
+    assert repository.calls[1] == ("search", ["doc1"], "tenant-a", "hnsw", None)
+    assert service.last_recall_diagnostics["search_strategy"] == "hnsw"
 
 
 def test_retrieve_uses_candidate_pool_and_reranks_to_top_k():

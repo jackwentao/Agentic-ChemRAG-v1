@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     reranker_chunk_candidates: int = Field(default=10, gt=0)
     reranker_figure_candidates: int = Field(default=10, gt=0)
     reranker_min_candidates: int = Field(default=10, gt=0)
+    retrieval_exact_chunk_limit: int = Field(default=2000, ge=0)
+    retrieval_exact_timeout_ms: int = Field(default=300, gt=0)
     reranker_warmup_on_startup: bool = True
     conversation_recent_turns: int = Field(default=3, ge=0)
     conversation_max_context_chars: int = Field(default=8000, gt=0)

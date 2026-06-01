@@ -49,6 +49,7 @@ WHERE file_hash IS NOT NULL;
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id TEXT PRIMARY KEY,
     document_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL DEFAULT 'demo',
     parent_id TEXT,
     text TEXT NOT NULL,
     page_start INTEGER NOT NULL,
@@ -58,6 +59,9 @@ CREATE TABLE IF NOT EXISTS chunks (
     chunk_type TEXT NOT NULL,
     embedding VECTOR(1024)
 );
+
+ALTER TABLE chunks
+ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo';
 
 CREATE TABLE IF NOT EXISTS images (
     image_id TEXT PRIMARY KEY,
@@ -108,6 +112,7 @@ CREATE TABLE IF NOT EXISTS figures (
 
 CREATE TABLE IF NOT EXISTS document_profiles (
     document_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL DEFAULT 'demo',
     title TEXT,
     abstract TEXT,
     conclusion TEXT,
@@ -122,9 +127,13 @@ CREATE TABLE IF NOT EXISTS document_profiles (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE document_profiles
+ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo';
+
 CREATE TABLE IF NOT EXISTS document_profile_embeddings (
     profile_field_id TEXT PRIMARY KEY,
     document_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL DEFAULT 'demo',
     field_name TEXT NOT NULL,
     field_text TEXT NOT NULL,
     source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -132,6 +141,9 @@ CREATE TABLE IF NOT EXISTS document_profile_embeddings (
     embedding VECTOR(1024),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE document_profile_embeddings
+ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo';
 
 CREATE TABLE IF NOT EXISTS chat_sessions (
     session_id TEXT PRIMARY KEY,
@@ -166,6 +178,18 @@ CREATE TABLE IF NOT EXISTS chat_contexts (
 CREATE INDEX IF NOT EXISTS chunks_embedding_idx
 ON chunks USING ivfflat (embedding vector_cosine_ops)
 WITH (lists = 100);
+
+CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw_idx
+ON chunks USING hnsw (embedding vector_cosine_ops);
+
+CREATE INDEX IF NOT EXISTS chunks_owner_document_idx
+ON chunks (owner_id, document_id, chunk_type);
+
+CREATE INDEX IF NOT EXISTS document_profiles_owner_document_idx
+ON document_profiles (owner_id, document_id);
+
+CREATE INDEX IF NOT EXISTS document_profile_embeddings_owner_document_idx
+ON document_profile_embeddings (owner_id, document_id, field_name);
 
 UPDATE documents
 SET indexing_status = 'succeeded',
