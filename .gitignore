@@ -19,6 +19,7 @@ frontend/dist/
 *.pyd
 *.log
 *.pdf
+Agentic_ChemRAG项目演示.mp4
 .coverage
 coverage.xml
 htmlcov/
