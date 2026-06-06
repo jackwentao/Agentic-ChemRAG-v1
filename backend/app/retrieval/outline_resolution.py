@@ -56,7 +56,6 @@ class OutlineReferenceResolver:
         if (
             len(candidate_document_ids) == 1
             and (_has_deictic_reference(normalized_question) or current_scope == "current_document")
-            and not _has_non_outline_followup(normalized_question)
         ):
             target_document_ids = candidate_document_ids
             return OutlineReferenceResolution(
@@ -65,8 +64,8 @@ class OutlineReferenceResolver:
                 basic_facts=basic_facts,
                 decision="single_document_outline",
                 target_document_ids=target_document_ids,
-                needs_outline_retrieval=True,
-                reason="问题中的论文指代已解析到唯一文档，只需要读取该文档的大纲/画像。",
+                needs_outline_retrieval=False,
+                reason="问题中的论文指代已解析到唯一文档，跳过前置相关论文定位。",
             )
 
         return OutlineReferenceResolution(

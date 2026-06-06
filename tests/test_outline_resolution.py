@@ -11,7 +11,7 @@ def test_outline_resolver_rewrites_single_current_document_reference():
 
     assert resolution.decision == "single_document_outline"
     assert resolution.target_document_ids == ["doc-1"]
-    assert resolution.needs_outline_retrieval is True
+    assert resolution.needs_outline_retrieval is False
     assert "文档 doc-1" in resolution.rewritten_question
     assert any("用户问题包含论文指代" in fact for fact in resolution.basic_facts)
 

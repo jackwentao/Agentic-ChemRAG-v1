@@ -5,7 +5,7 @@ from threading import Thread
 from time import perf_counter
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import StreamingResponse
 
 from backend.app.agents.rag_graph import MultiAgentRagGraph
@@ -23,6 +23,7 @@ from backend.app.schemas import (
     ChatMessagesResponse,
     ChatRequest,
     ChatResponse,
+    ChatSessionPinRequest,
     ChatSessionSummary,
     ChatSessionsResponse,
     Citation,
@@ -117,12 +118,7 @@ def list_chat_sessions(
 ) -> ChatSessionsResponse:
     return ChatSessionsResponse(
         sessions=[
-            ChatSessionSummary(
-                session_id=session.session_id,
-                title=session.title,
-                created_at=session.created_at,
-                updated_at=session.updated_at,
-            )
+            _to_chat_session_summary(session)
             for session in history_service.list_sessions()
         ]
     )
@@ -138,14 +134,31 @@ def list_chat_messages(
         raise HTTPException(status_code=404, detail="Chat session not found.")
     messages = history_service.list_messages(session.session_id)
     return ChatMessagesResponse(
-        session=ChatSessionSummary(
-            session_id=session.session_id,
-            title=session.title,
-            created_at=session.created_at,
-            updated_at=session.updated_at,
-        ),
+        session=_to_chat_session_summary(session),
         messages=[_to_chat_message(message) for message in messages],
     )
+
+
+@router.patch("/chat/sessions/{session_id}/pin", response_model=ChatSessionSummary)
+def set_chat_session_pin(
+    session_id: str,
+    request: ChatSessionPinRequest,
+    history_service: Annotated[ConversationHistoryService, Depends(get_conversation_history_service)],
+) -> ChatSessionSummary:
+    session = history_service.set_session_pinned(session_id, request.pinned)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+    return _to_chat_session_summary(session)
+
+
+@router.delete("/chat/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_chat_session(
+    session_id: str,
+    history_service: Annotated[ConversationHistoryService, Depends(get_conversation_history_service)],
+) -> Response:
+    if not history_service.delete_session(session_id):
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 def _run_chat_request(
@@ -241,6 +254,16 @@ def _to_chat_message(message) -> ChatMessage:
     )
 
 
+def _to_chat_session_summary(session) -> ChatSessionSummary:
+    return ChatSessionSummary(
+        session_id=session.session_id,
+        title=session.title,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        pinned=session.pinned,
+    )
+
+
 def resolve_chat_document_ids(request: ChatRequest, repository) -> list[str]:
     # current_document 模式由前端显式提供 document_ids；
     # all_documents 模式则回退到当前用户全部已建索引文档。
@@ -286,7 +309,7 @@ def _invoke_graph(
     except TypeError as exc:
         if "unexpected keyword" not in str(exc):
             raise
-        for key in ["owner_id", "session_id", "conversation_context", "answer_delta_callback", "stage_callback"]:
+        for key in ["stage_callback", "owner_id", "session_id", "conversation_context", "answer_delta_callback"]:
             kwargs.pop(key, None)
             try:
                 return graph.invoke(question, **kwargs)

@@ -403,6 +403,26 @@ def test_retrieve_uses_candidate_pool_and_reranks_to_top_k():
     assert service.last_rerank_diagnostics["skip_reason"] is None
 
 
+def test_single_document_retrieve_uses_fast_path_without_rerank_candidate_expansion():
+    repository = HybridRepository()
+    service = RetrievalService(
+        repository,
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_provider=FakeRerankerProvider(),
+        reranker_enabled=True,
+        reranker_chunk_candidates=30,
+        reranker_min_candidates=1,
+        lexical_chunk_candidates=30,
+    )
+
+    results = service.retrieve("what M.A. Eleruja do in the paper?", top_k=2, document_ids=["doc1"])
+
+    assert [item.chunk_id for item in results] == ["author-hit", "vector-general"]
+    assert repository.lexical_calls == [("what M.A. Eleruja do in the paper?", 2, ["doc1"], None)]
+    assert service.last_rerank_enabled is False
+    assert service.last_rerank_diagnostics["skip_reason"] == "single_document_fast_path"
+
+
 class FigureRepository:
     def __init__(self) -> None:
         self.top_k = None

@@ -22,7 +22,7 @@ class PgConversationRepository:
                     VALUES (:session_id, :owner_id, :title)
                     ON CONFLICT (session_id) DO UPDATE SET
                         updated_at = chat_sessions.updated_at
-                    RETURNING session_id, owner_id, title, created_at, updated_at
+                    RETURNING session_id, owner_id, title, created_at, updated_at, pinned
                     """
                 ),
                 {"session_id": session_id, "owner_id": owner_id, "title": title},
@@ -48,7 +48,7 @@ class PgConversationRepository:
             row = conn.execute(
                 text(
                     """
-                    SELECT session_id, owner_id, title, created_at, updated_at
+                    SELECT session_id, owner_id, title, created_at, updated_at, pinned
                     FROM chat_sessions
                     WHERE session_id = :session_id
                       AND owner_id = :owner_id
@@ -64,16 +64,47 @@ class PgConversationRepository:
             rows = conn.execute(
                 text(
                     """
-                    SELECT session_id, owner_id, title, created_at, updated_at
+                    SELECT session_id, owner_id, title, created_at, updated_at, pinned
                     FROM chat_sessions
                     WHERE owner_id = :owner_id
-                    ORDER BY updated_at DESC, created_at DESC
+                    ORDER BY pinned DESC, updated_at DESC, created_at DESC
                     LIMIT :limit
                     """
                 ),
                 {"owner_id": owner_id, "limit": limit},
             ).mappings().all()
         return [_session_from_row(dict(row)) for row in rows]
+
+    def set_session_pinned(self, session_id: str, owner_id: str, pinned: bool) -> ConversationSession | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    UPDATE chat_sessions
+                    SET pinned = :pinned,
+                        updated_at = CASE WHEN :pinned THEN now() ELSE updated_at END
+                    WHERE session_id = :session_id
+                      AND owner_id = :owner_id
+                    RETURNING session_id, owner_id, title, created_at, updated_at, pinned
+                    """
+                ),
+                {"session_id": session_id, "owner_id": owner_id, "pinned": pinned},
+            ).mappings().first()
+        return _session_from_row(dict(row)) if row else None
+
+    def delete_session(self, session_id: str, owner_id: str) -> bool:
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    DELETE FROM chat_sessions
+                    WHERE session_id = :session_id
+                      AND owner_id = :owner_id
+                    """
+                ),
+                {"session_id": session_id, "owner_id": owner_id},
+            )
+        return bool(result.rowcount)
 
     def add_message(self, message: ConversationMessage) -> ConversationMessage:
         with self.engine.begin() as conn:
@@ -187,6 +218,7 @@ class InMemoryConversationRepository:
                 title=session.title,
                 created_at=session.created_at,
                 updated_at=_now_iso(),
+                pinned=session.pinned,
             )
 
     def get_session(self, session_id: str, owner_id: str) -> ConversationSession | None:
@@ -195,8 +227,32 @@ class InMemoryConversationRepository:
 
     def list_sessions(self, owner_id: str, limit: int = 50) -> list[ConversationSession]:
         sessions = [session for session in self.sessions.values() if session.owner_id == owner_id]
-        sessions.sort(key=lambda item: item.updated_at, reverse=True)
+        sessions.sort(key=lambda item: (item.pinned, item.updated_at, item.created_at), reverse=True)
         return sessions[:limit]
+
+    def set_session_pinned(self, session_id: str, owner_id: str, pinned: bool) -> ConversationSession | None:
+        session = self.get_session(session_id, owner_id)
+        if session is None:
+            return None
+        stored = ConversationSession(
+            session_id=session.session_id,
+            owner_id=session.owner_id,
+            title=session.title,
+            created_at=session.created_at,
+            updated_at=_now_iso() if pinned else session.updated_at,
+            pinned=pinned,
+        )
+        self.sessions[session_id] = stored
+        return stored
+
+    def delete_session(self, session_id: str, owner_id: str) -> bool:
+        session = self.get_session(session_id, owner_id)
+        if session is None:
+            return False
+        self.sessions.pop(session_id, None)
+        self.messages.pop(session_id, None)
+        self.contexts.pop(session_id, None)
+        return True
 
     def add_message(self, message: ConversationMessage) -> ConversationMessage:
         stored = ConversationMessage(
@@ -258,6 +314,7 @@ def _session_from_row(row: dict[str, object]) -> ConversationSession:
         title=str(row["title"]),
         created_at=_stringify_time(row["created_at"]),
         updated_at=_stringify_time(row["updated_at"]),
+        pinned=bool(row.get("pinned", False)),
     )
 
 

@@ -67,6 +67,11 @@ class ChatSessionSummary(BaseModel):
     title: str
     created_at: str
     updated_at: str
+    pinned: bool = False
+
+
+class ChatSessionPinRequest(BaseModel):
+    pinned: bool
 
 
 class ChatMessage(BaseModel):

@@ -632,7 +632,7 @@ def test_multi_agent_rag_graph_resolves_pronoun_before_document_profile_retrieva
     assert state["route"] == "document_profile"
     assert repository.document_ids == ["d1"]
     assert state["diagnostics"]["outline_resolution"]["decision"] == "single_document_outline"
-    assert state["diagnostics"]["outline_resolution"]["needs_outline_retrieval"] is True
+    assert state["diagnostics"]["outline_resolution"]["needs_outline_retrieval"] is False
     assert "文档 d1" in state["query_plans"][0].resolved_question
 
 
@@ -907,7 +907,7 @@ class OutlineInjectedFigureRepository:
         ]
 
 
-def test_outline_context_is_injected_when_single_paper_question_continues_to_figure_step():
+def test_single_paper_question_skips_prefetch_before_continuing_to_figure_step():
     repository = OutlineInjectedFigureRepository()
     planner = CapturingFigurePlanner()
     graph = MultiAgentRagGraph(
@@ -917,15 +917,15 @@ def test_outline_context_is_injected_when_single_paper_question_continues_to_fig
 
     state = graph.invoke("这篇论文主要讲什么？顺便找一下和PL相关的图。", document_ids=["d1"])
 
-    assert repository.profile_queries == 1
+    assert repository.profile_queries == 0
     assert repository.figure_queries == 1
     assert state["route"] == "figure_index"
-    assert state["diagnostics"]["outline_context"]["injected"] is True
+    assert state["diagnostics"]["outline_context"]["injected"] is False
     assert state["diagnostics"]["outline_context"]["document_ids"] == ["d1"]
     assert planner.document_ids == ["d1"]
-    assert planner.outline_context[0].chunk_id == "profile:d1"
+    assert planner.outline_context == []
     assert any("用户问题包含论文指代" in fact for fact in planner.basic_facts)
-    assert [item.chunk_id for item in state["verified_evidence"]] == ["profile:d1", "figure:img1"]
+    assert [item.chunk_id for item in state["verified_evidence"]] == ["figure:img1"]
     assert state["completed_route_steps"][0]["route"] == "figure_index"
 
 

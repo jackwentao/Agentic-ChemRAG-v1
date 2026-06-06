@@ -100,10 +100,12 @@ class RetrievalService:
         candidate_chunk_count = self._count_searchable_chunks(document_ids=document_ids, owner_id=owner_id)
         search_strategy = self._chunk_search_strategy(candidate_chunk_count)
         search_started_at = perf_counter()
+        single_document_fast_path = self.reranker_enabled and _is_single_document_scope(document_ids)
+        vector_candidate_k = top_k if single_document_fast_path else candidate_k
         vector_evidence = _call_search(
             self.repository.search,
             query_embedding,
-            candidate_k,
+            vector_candidate_k,
             document_ids=document_ids,
             owner_id=owner_id,
             search_strategy=search_strategy,
@@ -116,10 +118,11 @@ class RetrievalService:
         figure_sidecar_latency_ms = 0.0
         if self.lexical_enabled and hasattr(self.repository, "search_lexical_chunks"):
             lexical_started_at = perf_counter()
+            lexical_candidate_k = top_k if single_document_fast_path else max(top_k, self.lexical_chunk_candidates)
             lexical_evidence = _call_lexical_search(
                 self.repository.search_lexical_chunks,
                 question,
-                max(top_k, self.lexical_chunk_candidates),
+                lexical_candidate_k,
                 document_ids=document_ids,
                 owner_id=owner_id,
             )
@@ -142,10 +145,10 @@ class RetrievalService:
         evidence, excluded_count = _exclude_existing(raw_evidence, exclude_keys)
         selected = (
             self._rerank_evidence(question, evidence, top_k, mode="chunk", excluded_count=excluded_count, incremental_only=bool(exclude_keys))
-            if self.reranker_enabled
+            if self.reranker_enabled and not single_document_fast_path
             else _select_hybrid_results(evidence, top_k, figure_sidecar_evidence)
         )
-        if not self.reranker_enabled:
+        if not self.reranker_enabled or single_document_fast_path:
             self.last_rerank_diagnostics = build_rerank_diagnostics(
                 enabled=False,
                 candidate_count=len(evidence),
@@ -153,7 +156,7 @@ class RetrievalService:
                 new_candidate_count=len(evidence),
                 excluded_existing_count=excluded_count,
                 incremental_only=bool(exclude_keys),
-                skip_reason="disabled",
+                skip_reason="single_document_fast_path" if single_document_fast_path else "disabled",
             )
         top_score, avg_score = score_summary(raw_evidence)
         self.last_recall_diagnostics = build_recall_diagnostics(
@@ -437,6 +440,10 @@ def _call_search(search_method, query_embedding, top_k: int, **kwargs):
                     raise
                 exc = retry_exc
         raise exc
+
+
+def _is_single_document_scope(document_ids: list[str] | None) -> bool:
+    return len(document_ids or []) == 1
 
 
 def _call_lexical_search(search_method, query: str, top_k: int, **kwargs):

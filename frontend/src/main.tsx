@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { FileUp, Send } from "lucide-react";
+import { FileUp, Pin, PinOff, Send, Trash2 } from "lucide-react";
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
@@ -69,6 +69,7 @@ type ChatSession = {
   title: string;
   created_at: string;
   updated_at: string;
+  pinned: boolean;
 };
 
 type ChatMessage = {
@@ -149,12 +150,19 @@ function App() {
     const response = await fetch(`${API_BASE}/api/chat/sessions`);
     const data: { sessions: ChatSession[] } = await response.json();
     setSessions(data.sessions);
-    const nextSessionId = preferredSessionId ?? sessionId ?? data.sessions[0]?.session_id ?? "";
+    const preferred = preferredSessionId
+      ? data.sessions.find((session) => session.session_id === preferredSessionId)
+      : undefined;
+    const current = sessionId ? data.sessions.find((session) => session.session_id === sessionId) : undefined;
+    const nextSessionId = preferred?.session_id ?? current?.session_id ?? data.sessions[0]?.session_id ?? "";
     if (nextSessionId) {
       setSessionId(nextSessionId);
       if (options.loadMessages !== false) {
         await loadMessages(nextSessionId);
       }
+    } else {
+      setSessionId("");
+      setMessages([]);
     }
   }
 
@@ -173,6 +181,44 @@ function App() {
     setMessages([]);
     setNotice("");
     setChatStage(null);
+  }
+
+  async function toggleSessionPinned(session: ChatSession) {
+    try {
+      const response = await fetch(`${API_BASE}/api/chat/sessions/${session.session_id}/pin`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pinned: !session.pinned })
+      });
+      const data = await readResponsePayload(response);
+      if (!response.ok) {
+        setNotice(apiErrorMessage(data, "Could not update this chat."));
+        return;
+      }
+      await refreshSessions(sessionId || undefined, { loadMessages: false });
+    } catch {
+      setNotice("Could not update this chat. Please try again.");
+    }
+  }
+
+  async function deleteSession(targetSessionId: string) {
+    if (!window.confirm("Delete this chat history?")) return;
+    try {
+      const response = await fetch(`${API_BASE}/api/chat/sessions/${targetSessionId}`, { method: "DELETE" });
+      if (!response.ok) {
+        const data = await readResponsePayload(response);
+        setNotice(apiErrorMessage(data, "Could not delete this chat."));
+        return;
+      }
+      if (targetSessionId === sessionId) {
+        setSessionId("");
+        setMessages([]);
+        setChatStage(null);
+      }
+      await refreshSessions(undefined, { loadMessages: targetSessionId !== sessionId });
+    } catch {
+      setNotice("Could not delete this chat. Please try again.");
+    }
   }
 
   async function upload(files: FileList) {
@@ -237,7 +283,8 @@ function App() {
   }
 
   async function ask() {
-    if (!question.trim()) return;
+    const submittedQuestion = question.trim();
+    if (!submittedQuestion) return;
     if (scope === "current_document" && !selectedDocument) {
       setNotice("Select a document first.");
       return;
@@ -255,10 +302,10 @@ function App() {
       return;
     }
 
-    const submittedQuestion = question;
     const tempUserMessageId = localMessageId("user");
     const tempAssistantMessageId = localMessageId("assistant");
     const requestDocumentIds = scope === "current_document" && documentId ? [documentId] : [];
+    setQuestion("");
     setMessages((currentMessages) => [
       ...currentMessages,
       {
@@ -344,7 +391,6 @@ function App() {
         if (event.event === "final") {
           finalResponse = event.data as ChatResponse;
           setSessionId(finalResponse.session_id);
-          setQuestion("");
           setMessages((currentMessages) =>
             currentMessages.map((message) => {
               if (message.message_id === tempUserMessageId) return finalResponse!.user_message;
@@ -427,20 +473,21 @@ function App() {
               ))}
             </div>
           )}
+        </aside>
 
-          <section className="sessions">
-            <header>
-              <h2>Chats</h2>
-              <button onClick={startNewChat}>New</button>
-            </header>
-            {sessions.length === 0 ? (
-              <p className="empty">Ask a question to start a chat.</p>
-            ) : (
-              <div className="session-list">
-                {sessions.map((session) => (
+        <aside className="sessions">
+          <header>
+            <h2>Chats</h2>
+            <button onClick={startNewChat}>New</button>
+          </header>
+          {sessions.length === 0 ? (
+            <p className="empty">Ask a question to start a chat.</p>
+          ) : (
+            <div className="session-list">
+              {sessions.map((session) => (
+                <article className={session.session_id === sessionId ? "session active" : "session"} key={session.session_id}>
                   <button
-                    className={session.session_id === sessionId ? "session active" : "session"}
-                    key={session.session_id}
+                    className="session-main"
                     onClick={() => {
                       setSessionId(session.session_id);
                       void loadMessages(session.session_id);
@@ -449,10 +496,26 @@ function App() {
                     <span>{session.title}</span>
                     <small>{formatSessionTime(session.updated_at)}</small>
                   </button>
-                ))}
-              </div>
-            )}
-          </section>
+                  <div className="session-actions">
+                    <button
+                      aria-label={session.pinned ? "Unpin chat" : "Pin chat"}
+                      onClick={() => void toggleSessionPinned(session)}
+                      title={session.pinned ? "Unpin chat" : "Pin chat"}
+                    >
+                      {session.pinned ? <PinOff size={16} /> : <Pin size={16} />}
+                    </button>
+                    <button
+                      aria-label="Delete chat"
+                      onClick={() => void deleteSession(session.session_id)}
+                      title="Delete chat"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
         </aside>
 
         <section className="chat">
@@ -479,12 +542,18 @@ function App() {
               messages.map((message) => <ChatMessageView key={message.message_id} message={message} />)
             )}
           </div>
-          <div className="composer">
+          <form
+            className="composer"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!busy) void ask();
+            }}
+          >
             <input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about mechanisms, methods, or results..." />
-            <button onClick={ask} disabled={busy}>
+            <button type="submit" disabled={busy}>
               <Send size={18} />
             </button>
-          </div>
+          </form>
         </section>
       </section>
     </main>
