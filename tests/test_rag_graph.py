@@ -1,4 +1,4 @@
-from backend.app.agents.rag_graph import MultiAgentRagGraph
+from backend.app.agents.rag_graph import MultiAgentRagGraph, _strong_lexical_verified_evidence
 from backend.app.domain.documents import Chunk, Evidence, EvidenceImage
 from backend.app.domain.rag import AnswerVerification, EvidenceAssessment, ImageSelectionResult, RoutePlan, RouteStep
 from backend.app.providers.embeddings import FakeEmbeddingProvider
@@ -66,6 +66,56 @@ def test_multi_agent_rag_graph_returns_answer_and_evidence():
     assert state["diagnostics"]["stop_reason"] == "sufficient_evidence"
     assert state["diagnostics"]["llm"]["answer_chars"] > 0
     assert state["total_latency_ms"] >= 0
+
+
+def test_multi_agent_rag_graph_emits_streaming_stage_updates():
+    embedding_provider = FakeEmbeddingProvider(dimensions=8)
+    repository = InMemoryVectorRepository()
+    chunk = Chunk(
+        chunk_id="c1",
+        document_id="d1",
+        parent_id="p1",
+        text="Chemical bonding improves interfacial charge transport in composites.",
+        page_start=2,
+        page_end=2,
+        section_title="Results and Discussion",
+        section_path="Results and Discussion",
+        chunk_type="child",
+    )
+    repository.add_chunks([chunk], embedding_provider.embed_documents([chunk.text]))
+    stages: list[tuple[str, str]] = []
+
+    graph = MultiAgentRagGraph(RetrievalService(repository, embedding_provider), FakeLlmProvider())
+    graph.invoke(
+        "How does chemical bonding affect transport?",
+        stage_callback=lambda stage, label: stages.append((stage, label)),
+    )
+
+    stage_names = [stage for stage, _label in stages]
+    assert stage_names[:2] == ["planning", "planning"]
+    assert "retrieval" in stage_names
+    assert "verification" in stage_names
+    assert "answering" in stage_names
+    assert stage_names[-1] == "finalizing"
+    assert all(label for _stage, label in stages)
+
+
+def test_strong_lexical_fallback_uses_original_lexical_score_after_rerank():
+    evidence = Evidence(
+        chunk_id="author-hit",
+        document_id="doc1",
+        text="M.A. Eleruja is a co-author from the Department of Physics, Obafemi Awolowo University.",
+        page_start=1,
+        page_end=1,
+        section_title="Title Page",
+        score=0.02,
+        evidence_type="chunk",
+        metadata={"retrieval_sources": ["lexical"], "lexical_score": 1.2},
+    )
+
+    verified = _strong_lexical_verified_evidence("what M.A. Eleruja do in the paper?", [evidence])
+
+    assert [item.chunk_id for item in verified] == ["author-hit"]
 
 
 class ImageCandidateRepository:

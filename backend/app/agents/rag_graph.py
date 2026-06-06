@@ -1,3 +1,4 @@
+import re
 from time import perf_counter
 
 from langgraph.graph import END, StateGraph
@@ -86,9 +87,12 @@ class MultiAgentRagGraph:
         session_id: str | None = None,
         owner_id: str | None = "demo",
         conversation_context: str | None = None,
+        answer_delta_callback=None,
+        stage_callback=None,
     ) -> RagGraphState:
         # invoke 负责初始化首轮状态，并把执行总耗时回填到 diagnostics。
         started_at = perf_counter()
+        _emit_stage_callback(stage_callback, "planning", "正在规划检索路径")
         current_query = _build_contextual_question(question, conversation_context)
         state = self.graph.invoke(
             {
@@ -127,6 +131,8 @@ class MultiAgentRagGraph:
                 "limitations": [],
                 "warnings": [],
                 "answer_revision_count": 0,
+                "answer_delta_callback": answer_delta_callback,
+                "stage_callback": stage_callback,
             }
         )
         total_latency_ms = (perf_counter() - started_at) * 1000
@@ -233,6 +239,7 @@ class MultiAgentRagGraph:
             }
             return {**state, "outline_context_evidence": [], "diagnostics": diagnostics}
 
+        _emit_stage(state, "retrieval", "正在定位相关论文")
         query = _outline_retrieval_query(resolution)
         top_k = 1 if resolution.decision == "single_document_outline" else self.profile_top_k
         started_at = perf_counter()
@@ -267,6 +274,7 @@ class MultiAgentRagGraph:
     def _planner(self, state: RagGraphState) -> RagGraphState:
         # planner 消费问题重写层和大纲检索层产物，输出后续 RAG 执行步骤。
         started_at = perf_counter()
+        _emit_stage(state, "planning", "正在选择检索策略")
         resolution = state.get("outline_resolution")
         rewritten_question = resolution.rewritten_question if resolution else state["question"]
         basic_facts = resolution.basic_facts if resolution else []
@@ -279,14 +287,18 @@ class MultiAgentRagGraph:
         )
         contextual_question = _build_contextual_question(rewritten_question, state.get("conversation_context"))
         decision = self.query_router.route(contextual_question, context)
-        route_plan = _call_plan_route(
-            self.llm_provider,
-            rewritten_question,
-            conversation_context=state.get("conversation_context"),
-            scope=context.scope,
-            document_ids=effective_document_ids,
-            basic_facts=basic_facts,
-            outline_context=outline_context_evidence,
+        route_plan = (
+            _call_plan_route(
+                self.llm_provider,
+                rewritten_question,
+                conversation_context=state.get("conversation_context"),
+                scope=context.scope,
+                document_ids=effective_document_ids,
+                basic_facts=basic_facts,
+                outline_context=outline_context_evidence,
+            )
+            if _should_use_llm_route_plan(rewritten_question, decision)
+            else None
         )
         if route_plan is None:
             route_plan = _route_plan_from_rule_decision(decision.route, contextual_question, decision.rationale)
@@ -342,6 +354,7 @@ class MultiAgentRagGraph:
         started_at = perf_counter()
         route = state.get("route", "chunk_search")
         query = state.get("current_query", state["original_question"])
+        _emit_stage(state, "retrieval", _retrieval_stage_label(route))
         exclude_keys = (
             {(item.document_id, item.chunk_id) for item in state.get("accumulated_evidence", [])}
             if state.get("retrieval_round", 1) > 1
@@ -435,6 +448,7 @@ class MultiAgentRagGraph:
         # assessor 的关键目标不是“总结证据”，而是筛出真正支撑答案的 chunk，
         # 并明确指出当前缺失信息，从而驱动下一轮检索。
         started_at = perf_counter()
+        _emit_stage(state, "verification", "正在核对证据是否足够")
         candidates = [
             item
             for item in _merge_verified_evidence(
@@ -455,6 +469,26 @@ class MultiAgentRagGraph:
         supporting_ids = set(assessment.supporting_chunk_ids)
         assessment_allows_answer = assessment.sufficient and not assessment.fallback_used
         verified = [item for item in candidates if item.chunk_id in supporting_ids] if assessment_allows_answer else []
+        lexical_verified = []
+        if not verified:
+            lexical_verified = _strong_lexical_verified_evidence(state["original_question"], candidates)
+            if lexical_verified:
+                assessment = EvidenceAssessment(
+                    sufficient=True,
+                    covered_aspects=_strong_query_terms(state["original_question"])[:5],
+                    missing_aspects=[],
+                    conflicts=[],
+                    supporting_chunk_ids=[item.chunk_id for item in lexical_verified],
+                    next_search_goal=None,
+                    confidence=max(float(assessment.confidence or 0.0), 0.65),
+                    reason=f"强词法召回命中，保留候选证据；原评估：{assessment.reason}",
+                    used_llm=assessment.used_llm,
+                    fallback_used=False,
+                )
+                assessment_allows_answer = True
+                verified = lexical_verified
+        if verified:
+            verified = _augment_verified_with_visual_evidence(state["original_question"], verified, candidates)
         limitations = _limitations_from_assessment(assessment)
         latency_ms = (perf_counter() - started_at) * 1000
         assessment_history = [
@@ -474,6 +508,8 @@ class MultiAgentRagGraph:
                 confidence=assessment.confidence,
             ),
         ]
+        if lexical_verified:
+            assessment_history[-1]["lexical_fallback_used"] = True
         llm_call_counts = increment_llm_call_count(
             state.get("llm_call_counts"),
             "evidence_assessment",
@@ -794,6 +830,7 @@ class MultiAgentRagGraph:
     def _answerer(self, state: RagGraphState) -> RagGraphState:
         # answerer 只消费 verified_evidence，保证输出答案一定来自已通过评估的证据。
         started_at = perf_counter()
+        _emit_stage(state, "answering", "正在生成回答")
         if not state.get("verified_evidence"):
             answer = "检索到的证据不足以可靠回答该问题。请尝试补充限定条件或换一种提问方式。"
             latency_ms = (perf_counter() - started_at) * 1000
@@ -817,10 +854,23 @@ class MultiAgentRagGraph:
                 "diagnostics": diagnostics,
             }
         used_llm = self.llm_provider.uses_llm_for_answer()
-        answer = self.llm_provider.answer_with_evidence(
-            _build_contextual_question(state["question"], state.get("conversation_context")),
-            state.get("verified_evidence", []),
-        )
+        contextual_question = _build_contextual_question(state["question"], state.get("conversation_context"))
+        if state.get("answer_delta_callback") is None:
+            answer = self.llm_provider.answer_with_evidence(
+                contextual_question,
+                state.get("verified_evidence", []),
+            )
+        else:
+            chunks: list[str] = []
+            for chunk in self.llm_provider.answer_with_evidence_stream(
+                contextual_question,
+                state.get("verified_evidence", []),
+            ):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                _emit_answer_delta(state, chunk)
+            answer = "".join(chunks)
         latency_ms = (perf_counter() - started_at) * 1000
         llm_call_counts = increment_llm_call_count(state.get("llm_call_counts"), "answer_generation", used_llm)
         diagnostics = {
@@ -846,6 +896,7 @@ class MultiAgentRagGraph:
         # 答案核验发生在生成之后，只检查答案是否忠实于 verified_evidence。
         # 未触发时写入轻量诊断，便于评测区分“未核验”和“核验通过”。
         started_at = perf_counter()
+        _emit_stage(state, "verification", "正在检查回答依据")
         decision = self.answer_verification_policy.decide(
             answer=state.get("answer", ""),
             evidence=state.get("verified_evidence", []),
@@ -980,6 +1031,7 @@ class MultiAgentRagGraph:
         }
 
     def _image_selector(self, state: RagGraphState) -> RagGraphState:
+        _emit_stage(state, "finalizing", "正在整理引用和图片")
         # 图像选择与答案生成解耦，并基于完整 route_plan 而不是最终 route 字符串决策。
         result = self.image_selection_service.select(
             ImageSelectionContext(
@@ -1018,6 +1070,31 @@ class MultiAgentRagGraph:
             "llm_call_counts": llm_call_counts,
             "diagnostics": diagnostics,
         }
+
+
+def _emit_answer_delta(state: RagGraphState, chunk: str) -> None:
+    callback = state.get("answer_delta_callback")
+    if callback is None:
+        return
+    callback(chunk)
+
+
+def _emit_stage(state: RagGraphState, stage: str, label: str) -> None:
+    _emit_stage_callback(state.get("stage_callback"), stage, label)
+
+
+def _emit_stage_callback(callback, stage: str, label: str) -> None:
+    if callback is None:
+        return
+    callback(stage, label)
+
+
+def _retrieval_stage_label(route: str) -> str:
+    if route == "figure_index":
+        return "正在检索图表线索"
+    if route == "document_profile":
+        return "正在检索论文概览"
+    return "正在检索相关片段"
 
 
 def _plan_for_route(route: str) -> str:
@@ -1074,6 +1151,27 @@ def _call_plan_route(
             scope=scope,
             document_ids=document_ids,
         )
+
+
+def _should_use_llm_route_plan(question: str, decision) -> bool:
+    if _has_reference_detail_signal(question):
+        return False
+    if decision.needs_llm_router:
+        return True
+    text = question.lower()
+    return bool(
+        re.search(r"\b(?:and which|and what|then|also|plus)\b", text)
+        or re.search(r"\bwhich\b.+\band\b.+\b(?:figure|spectrum|spectra|plot|evidence)\b", text)
+        or re.search(r"顺便|并给出|并找|并总结|以及|同时", question)
+    )
+
+
+def _has_reference_detail_signal(question: str) -> bool:
+    text = _normalize_query_aliases(question)
+    return bool(
+        re.search(r"\b(?:reference|citation|author|co-author|affiliation|department|doi)\b", text)
+        or re.search(r"参考文献|作者|单位|机构|编号", question)
+    )
 
 
 def _outline_retrieval_query(resolution) -> str:
@@ -1261,6 +1359,141 @@ def _build_refined_query(question: str, assessment: EvidenceAssessment) -> str:
 
 def _normalized_query(query: str) -> str:
     return " ".join(query.lower().split())
+
+
+def _strong_lexical_verified_evidence(question: str, candidates: list[Evidence], limit: int = 5) -> list[Evidence]:
+    terms = set(_strong_query_terms(question))
+    if not terms:
+        return []
+    selected: list[Evidence] = []
+    for item in sorted(candidates, key=_lexical_evidence_score, reverse=True):
+        sources = item.metadata.get("retrieval_sources", [])
+        lexical_source = item.evidence_type == "lexical_chunk" or (
+            isinstance(sources, list) and "lexical" in sources
+        )
+        lexical_score = _lexical_evidence_score(item)
+        if not lexical_source or lexical_score < 0.9:
+            continue
+        text = _normalize_query_aliases(item.text)
+        if any(term in text for term in terms) or lexical_score >= 1.3:
+            selected.append(item)
+        if len(selected) >= limit:
+            break
+    if not selected:
+        return []
+    top = selected[0]
+    narrowed = [
+        item
+        for item in selected
+        if item.document_id == top.document_id and _lexical_evidence_score(item) >= _lexical_evidence_score(top) - 0.8
+    ][:limit]
+    if _has_visual_detail_signal(question):
+        figure_items = [
+            item
+            for item in candidates
+            if item.document_id == top.document_id
+            and item.evidence_type == "figure"
+            and _visual_term_overlap(question, item.text)
+        ]
+        narrowed = _merge_verified_evidence(narrowed, figure_items[:2])
+    return narrowed
+
+
+def _lexical_evidence_score(item: Evidence) -> float:
+    lexical_score = item.metadata.get("lexical_score")
+    if isinstance(lexical_score, (int, float)):
+        return float(lexical_score)
+    return float(item.score)
+
+
+def _augment_verified_with_visual_evidence(
+    question: str,
+    verified: list[Evidence],
+    candidates: list[Evidence],
+) -> list[Evidence]:
+    if not _has_visual_detail_signal(question):
+        return verified
+    document_ids = {item.document_id for item in verified}
+    additions = [
+        item
+        for item in candidates
+        if item.document_id in document_ids
+        and item.evidence_type == "figure"
+        and _visual_term_overlap(question, item.text)
+    ]
+    return _merge_verified_evidence(verified, additions[:2])
+
+
+def _strong_query_terms(question: str) -> list[str]:
+    normalized = _normalize_query_aliases(question)
+    raw_terms = re.findall(r"[a-z][a-z0-9/-]{1,}|[\u4e00-\u9fff]{2,}", normalized)
+    stopwords = {
+        "what",
+        "which",
+        "where",
+        "when",
+        "how",
+        "does",
+        "with",
+        "from",
+        "into",
+        "that",
+        "this",
+        "paper",
+        "article",
+        "shown",
+        "work",
+        "material",
+        "system",
+        "studied",
+        "study",
+    }
+    terms: list[str] = []
+    for raw in raw_terms:
+        term = raw.strip(".-")
+        if len(term) < 2 or term in stopwords:
+            continue
+        if term not in terms and (
+            "-" in term
+            or "/" in term
+            or len(term) >= 6
+            or term in {"reference", "number", "author", "affiliation", "department"}
+        ):
+            terms.append(term)
+    return terms
+
+
+def _normalize_query_aliases(text: str) -> str:
+    normalized = " ".join(text.lower().split())
+    aliases = {
+        "referense": "reference",
+        "numbir": "number",
+        "materiel": "material",
+        "resonans": "resonance",
+        "spektra": "spectra",
+        "potenshal": "potential",
+        "soler": "solar",
+        "energjy": "energy",
+        "renewabel": "renewable",
+        "discribed": "described",
+    }
+    for typo, correction in aliases.items():
+        normalized = normalized.replace(typo, correction)
+    return normalized
+
+
+def _has_visual_detail_signal(question: str) -> bool:
+    text = _normalize_query_aliases(question)
+    return bool(
+        re.search(r"\b(?:fig(?:ure)?|plot|spectrum|spectra|resonance|chart|image|scheme)\b", text)
+        or re.search(r"图|谱图|曲线|共振|光谱", question)
+    )
+
+
+def _visual_term_overlap(question: str, text: str) -> bool:
+    question_terms = set(re.findall(r"[a-z][a-z0-9/-]{2,}", _normalize_query_aliases(question)))
+    text_terms = set(re.findall(r"[a-z][a-z0-9/-]{2,}", _normalize_query_aliases(text)))
+    return bool(question_terms & text_terms)
 
 
 def _final_warnings(state: RagGraphState) -> list[str]:

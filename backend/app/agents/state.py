@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from typing import TypedDict
 
 from backend.app.domain.documents import Evidence, EvidenceImage
@@ -57,6 +58,8 @@ class RagGraphState(TypedDict, total=False):
     verification_latency_ms: float
     selected_images: dict[str, list[EvidenceImage]]
     answer: str
+    answer_delta_callback: Callable[[str], None] | None
+    stage_callback: Callable[[str, str], None] | None
     limitations: list[str]
     answer_verification: AnswerVerification | None
     answer_verification_latency_ms: float

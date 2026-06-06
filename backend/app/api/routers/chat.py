@@ -1,9 +1,12 @@
 import json
 import logging
+from queue import Queue
+from threading import Thread
 from time import perf_counter
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 
 from backend.app.agents.rag_graph import MultiAgentRagGraph
 from backend.app.api.dependencies import (
@@ -40,24 +43,136 @@ def chat(
     history_service: Annotated[ConversationHistoryService, Depends(get_conversation_history_service)],
     context_service: Annotated[ConversationContextService, Depends(get_conversation_context_service)],
 ) -> ChatResponse:
-    # chat 路由本身尽量保持“薄”：
-    # 只负责解析 scope、调用 graph，并把内部状态映射为对外响应模型。
+    try:
+        return _run_chat_request(
+            request,
+            repository=repository,
+            graph=graph,
+            history_service=history_service,
+            context_service=context_service,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+
+@router.post("/chat/stream")
+def chat_stream(
+    request: ChatRequest,
+    repository: Annotated[PgVectorRepository, Depends(get_repository)],
+    graph: Annotated[MultiAgentRagGraph, Depends(get_rag_graph)],
+    history_service: Annotated[ConversationHistoryService, Depends(get_conversation_history_service)],
+    context_service: Annotated[ConversationContextService, Depends(get_conversation_context_service)],
+) -> StreamingResponse:
+    events: Queue[tuple[str, object]] = Queue()
+
+    def on_answer_delta(chunk: str) -> None:
+        events.put(("answer_delta", {"delta": chunk}))
+
+    def on_stage(stage: str, label: str) -> None:
+        events.put(("stage", {"stage": stage, "label": label}))
+
+    def run() -> None:
+        try:
+            response = _run_chat_request(
+                request,
+                repository=repository,
+                graph=graph,
+                history_service=history_service,
+                context_service=context_service,
+                on_answer_delta=on_answer_delta,
+                on_stage=on_stage,
+            )
+            events.put(("final", response.model_dump(mode="json")))
+        except TimeoutError as exc:
+            events.put(("error", {"status_code": 504, "detail": str(exc)}))
+        except HTTPException as exc:
+            events.put(("error", {"status_code": exc.status_code, "detail": exc.detail}))
+        except Exception:
+            logger.exception("Chat stream failed.")
+            events.put(("error", {"status_code": 500, "detail": "Chat stream failed."}))
+        finally:
+            events.put(("done", {}))
+
+    def event_generator():
+        worker = Thread(target=run, daemon=True)
+        worker.start()
+        yield _sse_event("status", {"stage": "started"})
+        while True:
+            event, payload = events.get()
+            if event == "done":
+                yield _sse_event("done", {})
+                break
+            yield _sse_event(event, payload)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/chat/sessions", response_model=ChatSessionsResponse)
+def list_chat_sessions(
+    history_service: Annotated[ConversationHistoryService, Depends(get_conversation_history_service)],
+) -> ChatSessionsResponse:
+    return ChatSessionsResponse(
+        sessions=[
+            ChatSessionSummary(
+                session_id=session.session_id,
+                title=session.title,
+                created_at=session.created_at,
+                updated_at=session.updated_at,
+            )
+            for session in history_service.list_sessions()
+        ]
+    )
+
+
+@router.get("/chat/sessions/{session_id}/messages", response_model=ChatMessagesResponse)
+def list_chat_messages(
+    session_id: str,
+    history_service: Annotated[ConversationHistoryService, Depends(get_conversation_history_service)],
+) -> ChatMessagesResponse:
+    session = history_service.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+    messages = history_service.list_messages(session.session_id)
+    return ChatMessagesResponse(
+        session=ChatSessionSummary(
+            session_id=session.session_id,
+            title=session.title,
+            created_at=session.created_at,
+            updated_at=session.updated_at,
+        ),
+        messages=[_to_chat_message(message) for message in messages],
+    )
+
+
+def _run_chat_request(
+    request: ChatRequest,
+    *,
+    repository: PgVectorRepository,
+    graph: MultiAgentRagGraph,
+    history_service: ConversationHistoryService,
+    context_service: ConversationContextService,
+    on_answer_delta=None,
+    on_stage=None,
+) -> ChatResponse:
     document_ids = resolve_chat_document_ids(request, repository)
     session = history_service.ensure_session(request.session_id, title_seed=request.question)
     conversation_context = context_service.get_context_text(session.session_id)
     started_at = perf_counter()
-    try:
-        state = _invoke_graph(
-            graph,
-            request.question,
-            document_ids=document_ids,
-            scope=request.scope,
-            session_id=session.session_id,
-            owner_id=DEFAULT_OWNER_ID,
-            conversation_context=conversation_context,
-        )
-    except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    state = _invoke_graph(
+        graph,
+        request.question,
+        document_ids=document_ids,
+        scope=request.scope,
+        session_id=session.session_id,
+        owner_id=DEFAULT_OWNER_ID,
+        conversation_context=conversation_context,
+        answer_delta_callback=on_answer_delta,
+        stage_callback=on_stage,
+    )
     evidence = state.get("verified_evidence", [])
     selected_images = state.get("selected_images", {})
     diagnostics_payload = dict(state.get("diagnostics", {}))
@@ -105,41 +220,9 @@ def chat(
     )
 
 
-@router.get("/chat/sessions", response_model=ChatSessionsResponse)
-def list_chat_sessions(
-    history_service: Annotated[ConversationHistoryService, Depends(get_conversation_history_service)],
-) -> ChatSessionsResponse:
-    return ChatSessionsResponse(
-        sessions=[
-            ChatSessionSummary(
-                session_id=session.session_id,
-                title=session.title,
-                created_at=session.created_at,
-                updated_at=session.updated_at,
-            )
-            for session in history_service.list_sessions()
-        ]
-    )
-
-
-@router.get("/chat/sessions/{session_id}/messages", response_model=ChatMessagesResponse)
-def list_chat_messages(
-    session_id: str,
-    history_service: Annotated[ConversationHistoryService, Depends(get_conversation_history_service)],
-) -> ChatMessagesResponse:
-    session = history_service.get_session(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Chat session not found.")
-    messages = history_service.list_messages(session.session_id)
-    return ChatMessagesResponse(
-        session=ChatSessionSummary(
-            session_id=session.session_id,
-            title=session.title,
-            created_at=session.created_at,
-            updated_at=session.updated_at,
-        ),
-        messages=[_to_chat_message(message) for message in messages],
-    )
+def _sse_event(event: str, payload: object) -> str:
+    data = json.dumps(payload, ensure_ascii=False)
+    return f"event: {event}\ndata: {data}\n\n"
 
 
 def _to_chat_message(message) -> ChatMessage:
@@ -184,6 +267,8 @@ def _invoke_graph(
     session_id: str,
     owner_id: str,
     conversation_context: str,
+    answer_delta_callback=None,
+    stage_callback=None,
 ):
     kwargs = {
         "document_ids": document_ids,
@@ -192,12 +277,16 @@ def _invoke_graph(
         "owner_id": owner_id,
         "conversation_context": conversation_context,
     }
+    if answer_delta_callback is not None:
+        kwargs["answer_delta_callback"] = answer_delta_callback
+    if stage_callback is not None:
+        kwargs["stage_callback"] = stage_callback
     try:
         return graph.invoke(question, **kwargs)
     except TypeError as exc:
         if "unexpected keyword" not in str(exc):
             raise
-        for key in ["owner_id", "session_id", "conversation_context"]:
+        for key in ["owner_id", "session_id", "conversation_context", "answer_delta_callback", "stage_callback"]:
             kwargs.pop(key, None)
             try:
                 return graph.invoke(question, **kwargs)
