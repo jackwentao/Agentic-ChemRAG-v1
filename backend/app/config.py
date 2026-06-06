@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     env: str = "dev"
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    database_auto_prepare: bool = True
 
     database_url: str = "postgresql+psycopg://chemrag:chemrag@localhost:5432/chemrag"
     redis_url: str = "redis://localhost:6380/0"
@@ -59,6 +60,19 @@ class Settings(BaseSettings):
     conversation_assistant_excerpt_chars: int = Field(default=240, gt=0)
     conversation_citation_limit_per_turn: int = Field(default=3, ge=0)
     conversation_limitation_limit_per_turn: int = Field(default=2, ge=0)
+    upload_max_file_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
+    upload_max_batch_files: int = Field(default=10, gt=0)
+    upload_spool_max_memory_bytes: int = Field(default=8 * 1024 * 1024, gt=0)
+    upload_allowed_mime_types: str = "application/pdf"
+    pdf_max_pages: int = Field(default=300, gt=0)
+    pdf_parse_probe_timeout_seconds: float = Field(default=10.0, gt=0)
+    pdf_max_extracted_images: int = Field(default=500, ge=0)
+    pdf_max_image_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    malware_scanner_provider: str = "noop"
+    request_id_header: str = "X-Request-ID"
+    log_format: str = "plain"
+    metrics_enabled: bool = True
+    app_version: str = "0.1.0"
 
 
 @lru_cache

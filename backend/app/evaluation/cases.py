@@ -57,6 +57,9 @@ class GoldenCase:
     required_disclosures: list[str] = field(default_factory=list)
     expected_retrieval_behavior: RetrievalBehavior = "single_round_expected"
     max_acceptable_rounds: int = 1
+    reference_answer: str | None = None
+    reference_contexts: list[str] = field(default_factory=list)
+    ragas_tags: list[str] = field(default_factory=list)
 
 
 def load_golden_cases(path: Path) -> list[GoldenCase]:
@@ -125,6 +128,11 @@ def parse_golden_case(payload: dict[str, Any], source: str = "<case>") -> Golden
         "max_acceptable_rounds",
         source,
     )
+    reference_answer = payload.get("reference_answer")
+    if reference_answer is not None and not isinstance(reference_answer, str):
+        raise ValueError(f"{source}: reference_answer must be a string or null")
+    reference_contexts = _string_list(payload.get("reference_contexts", []), "reference_contexts", source)
+    ragas_tags = _string_list(payload.get("ragas_tags", []), "ragas_tags", source)
 
     return GoldenCase(
         case_id=case_id,
@@ -145,6 +153,9 @@ def parse_golden_case(payload: dict[str, Any], source: str = "<case>") -> Golden
         required_disclosures=required_disclosures,
         expected_retrieval_behavior=expected_retrieval_behavior,  # type: ignore[arg-type]
         max_acceptable_rounds=max_acceptable_rounds,
+        reference_answer=reference_answer,
+        reference_contexts=reference_contexts,
+        ragas_tags=ragas_tags,
     )
 
 

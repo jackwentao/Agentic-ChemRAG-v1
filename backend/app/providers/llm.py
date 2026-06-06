@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 import json
 import re
+from typing import Iterator
 
 from backend.app.config import Settings
 from backend.app.domain.documents import DocumentSection, Evidence, EvidenceImage, SourceRef
@@ -20,6 +21,11 @@ class LlmProvider(ABC):
     @abstractmethod
     def answer_with_evidence(self, question: str, evidence: list[Evidence]) -> str:
         raise NotImplementedError
+
+    def answer_with_evidence_stream(self, question: str, evidence: list[Evidence]) -> Iterator[str]:
+        answer = self.answer_with_evidence(question, evidence)
+        if answer:
+            yield answer
 
     def uses_llm_for_answer(self) -> bool:
         return True
@@ -220,6 +226,9 @@ class DeepSeekLlmProvider(LlmProvider):
         return _sanitize_route_plan(payload, question)
 
     def answer_with_evidence(self, question: str, evidence: list[Evidence]) -> str:
+        author_answer = _answer_author_detail_question(question, evidence)
+        if author_answer:
+            return author_answer
         context = "\n\n".join(_format_evidence_for_prompt(idx, item) for idx, item in enumerate(evidence))
         messages = [
             {
@@ -227,7 +236,9 @@ class DeepSeekLlmProvider(LlmProvider):
                 "content": (
                     "You answer chemistry/materials-science questions using only the provided evidence. "
                     "Cite page numbers when evidence has page spans; when evidence is document-level profile data, "
-                    "describe it as document-level profile evidence instead of inventing a page citation."
+                    "describe it as document-level profile evidence instead of inventing a page citation. "
+                    "For author or affiliation questions, include the supported author status and affiliation details "
+                    "when present, and explicitly say when individual contribution details are not provided."
                 ),
             },
             {"role": "user", "content": f"Question:\n{question}\n\nEvidence:\n{context}"},
@@ -241,6 +252,52 @@ class DeepSeekLlmProvider(LlmProvider):
         except Exception as exc:
             if _is_recoverable_llm_error(exc):
                 return _fallback_answer_with_evidence(question, evidence)
+            raise
+
+    def answer_with_evidence_stream(self, question: str, evidence: list[Evidence]) -> Iterator[str]:
+        author_answer = _answer_author_detail_question(question, evidence)
+        if author_answer:
+            yield author_answer
+            return
+        context = "\n\n".join(_format_evidence_for_prompt(idx, item) for idx, item in enumerate(evidence))
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You answer chemistry/materials-science questions using only the provided evidence. "
+                    "Cite page numbers when evidence has page spans; when evidence is document-level profile data, "
+                    "describe it as document-level profile evidence instead of inventing a page citation. "
+                    "For author or affiliation questions, include the supported author status and affiliation details "
+                    "when present, and explicitly say when individual contribution details are not provided."
+                ),
+            },
+            {"role": "user", "content": f"Question:\n{question}\n\nEvidence:\n{context}"},
+        ]
+        future = self.executor.submit(
+            self.client.chat.completions.create,
+            model=self.model,
+            messages=messages,
+            stream=True,
+        )
+        try:
+            stream = future.result(timeout=self.timeout_seconds)
+            emitted = False
+            for event in stream:
+                delta = event.choices[0].delta.content or ""
+                if not delta:
+                    continue
+                emitted = True
+                yield delta
+            if not emitted:
+                fallback = _fallback_answer_with_evidence(question, evidence)
+                if fallback:
+                    yield fallback
+        except FutureTimeoutError:
+            yield _fallback_answer_with_evidence(question, evidence)
+        except Exception as exc:
+            if _is_recoverable_llm_error(exc):
+                yield _fallback_answer_with_evidence(question, evidence)
+                return
             raise
 
     def extract_document_profile(
@@ -266,10 +323,16 @@ class DeepSeekLlmProvider(LlmProvider):
                     "实体应覆盖材料/化合物/方法/性能/应用/表征技术等开放领域词，而不是只限固定词表。"
                     "source_refs 用于说明字段来自哪里，尽量填 field_name、source_type、page_start/page_end 和短 text。"
                     "严格输出 JSON："
-                    '{"title":null或字符串,"abstract":null或字符串,"conclusion":null或字符串,'
+                    '{"title":null或字符串,"authors":["..."],"affiliations":["..."],'
+                    '"corresponding_author":null或字符串,"journal":null或字符串,'
+                    '"publication_year":null或数字,"doi":null或字符串,"keywords":["..."],'
+                    '"abstract":null或字符串,"conclusion":null或字符串,'
                     '"topics":["..."],"entities":["..."],"key_findings":["..."],'
                     '"methods":["..."],"properties":["..."],"applications":["..."],'
-                    '"limitations":["..."],"source_refs":[{"source_type":"page_text或figure_caption",'
+                    '"limitations":["..."],'
+                    '"outline":[{"title":"...","normalized_type":"abstract|introduction|methods|results|discussion|conclusion|references|other",'
+                    '"page_start":1,"page_end":2,"summary":"...","keywords":["..."]}],'
+                    '"source_refs":[{"source_type":"page_text或figure_caption",'
                     '"page_start":1,"page_end":1,"section_title":"...","field_name":"abstract","text":"..."}],'
                     '"reason":"简短说明"}。'
                 ),
@@ -850,6 +913,9 @@ class ComposedLlmProvider(LlmProvider):
     def answer_with_evidence(self, question: str, evidence: list[Evidence]) -> str:
         return self.answer_provider.answer_with_evidence(question, evidence)
 
+    def answer_with_evidence_stream(self, question: str, evidence: list[Evidence]) -> Iterator[str]:
+        yield from self.answer_provider.answer_with_evidence_stream(question, evidence)
+
     def assess_evidence(self, question: str, evidence: list[Evidence]) -> EvidenceAssessment:
         return self.assessment_provider.assess_evidence(question, evidence)
 
@@ -1000,6 +1066,13 @@ def _sanitize_document_profile_extraction(
     return ProfileExtraction(
         document_id=document_id,
         title=_sanitize_optional_text(payload.get("title"), max_chars=300),
+        authors=_sanitize_string_list(payload.get("authors"), limit=30),
+        affiliations=_sanitize_string_list(payload.get("affiliations"), limit=20),
+        corresponding_author=_sanitize_optional_text(payload.get("corresponding_author"), max_chars=240),
+        journal=_sanitize_optional_text(payload.get("journal"), max_chars=240),
+        publication_year=_sanitize_year(payload.get("publication_year")),
+        doi=_sanitize_optional_text(payload.get("doi"), max_chars=160),
+        keywords=_sanitize_string_list(payload.get("keywords"), limit=30),
         abstract=_sanitize_optional_text(payload.get("abstract"), max_chars=1600),
         conclusion=_sanitize_optional_text(payload.get("conclusion"), max_chars=1600),
         topics=_sanitize_string_list(payload.get("topics"), limit=20),
@@ -1009,7 +1082,7 @@ def _sanitize_document_profile_extraction(
         properties=_sanitize_string_list(payload.get("properties"), limit=12),
         applications=_sanitize_string_list(payload.get("applications"), limit=12),
         limitations=_sanitize_string_list(payload.get("limitations"), limit=12),
-        outline=outline,
+        outline=_sanitize_document_sections(payload.get("outline")) or outline,
         source_refs=_sanitize_source_refs(payload.get("source_refs")),
         extraction_method="llm",
     )
@@ -1121,6 +1194,49 @@ def _sanitize_optional_text(value: object, max_chars: int) -> str | None:
         return None
     text_value = re.sub(r"\s+", " ", value).strip()
     return text_value[:max_chars] if text_value else None
+
+
+def _sanitize_year(value: object) -> int | None:
+    try:
+        year = int(value)
+    except (TypeError, ValueError):
+        return None
+    return year if 1800 <= year <= 2100 else None
+
+
+def _sanitize_document_sections(value: object) -> list[DocumentSection]:
+    if not isinstance(value, list):
+        return []
+    sections: list[DocumentSection] = []
+    for item in value[:60]:
+        if not isinstance(item, dict):
+            continue
+        title = _sanitize_optional_text(item.get("title"), max_chars=160)
+        if not title:
+            continue
+        page_start = _optional_int(item.get("page_start"))
+        page_end = _optional_int(item.get("page_end")) or page_start
+        sections.append(
+            DocumentSection(
+                title=title,
+                normalized_type=_sanitize_section_type(item.get("normalized_type")),
+                page_start=page_start,
+                page_end=page_end,
+                summary=_sanitize_optional_text(item.get("summary"), max_chars=700),
+                keywords=_sanitize_string_list(item.get("keywords"), limit=12),
+                linked_figures=_sanitize_string_list(item.get("linked_figures"), limit=12),
+                source_refs=_sanitize_source_refs(item.get("source_refs")),
+            )
+        )
+    return sections
+
+
+def _sanitize_section_type(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower().replace(" ", "_")[:40]
+    allowed = {"abstract", "introduction", "methods", "results", "discussion", "conclusion", "references", "other"}
+    return normalized if normalized in allowed else None
 
 
 def _sanitize_source_refs(value: object) -> list[SourceRef]:
@@ -1334,6 +1450,79 @@ def _fallback_answer_with_evidence(question: str, evidence: list[Evidence]) -> s
         snippet = re.sub(r"\s+", " ", item.text).strip()[:260]
         lines.append(f"[{index}] {_evidence_location(item)}，{item.section_title}：{snippet}")
     return "\n".join(lines)
+
+
+def _answer_author_detail_question(question: str, evidence: list[Evidence]) -> str:
+    author = _author_name_from_question(question)
+    if not author or not _looks_like_author_detail_question(question):
+        return ""
+    for item in evidence:
+        text = re.sub(r"\s+", " ", item.text).strip()
+        if not _author_name_matches(author, text):
+            continue
+        affiliation = _affiliation_for_author(author, text)
+        location = _evidence_location(item)
+        parts = [
+            f"Based on the verified evidence, {author} is listed as a co-author of the paper.",
+        ]
+        if affiliation:
+            parts.append(f"The evidence links {author} to {affiliation}.")
+        parts.append("The evidence does not specify an individual contribution or task performed by this author.")
+        parts.append(f"Source: {location}.")
+        return " ".join(parts)
+    return ""
+
+
+def _looks_like_author_detail_question(question: str) -> bool:
+    normalized = question.lower()
+    return bool(
+        re.search(r"\b(?:author|co-?author|affiliation|department|who|what|do|did|role|contribution)\b", normalized)
+        or re.search(r"作者|单位|机构|贡献|做了什么", question)
+    )
+
+
+def _author_name_from_question(question: str) -> str:
+    match = re.search(r"\b(?:[A-Za-z]\.\s*){1,4}[A-Za-z][A-Za-z-]+\b", question)
+    if not match:
+        return ""
+    raw = re.sub(r"\s+", " ", match.group(0)).strip()
+    initials = "".join(part.upper() for part in re.findall(r"[A-Za-z]\.", raw))
+    surname_match = re.search(r"([A-Za-z][A-Za-z-]+)$", raw)
+    if not surname_match:
+        return raw
+    surname = surname_match.group(1)
+    return f"{initials} {surname}"
+
+
+def _author_name_matches(author: str, text: str) -> bool:
+    return bool(re.search(_author_regex(author), text, re.IGNORECASE))
+
+
+def _affiliation_for_author(author: str, text: str) -> str:
+    author_match = re.search(_author_regex(author) + r"\s*(?P<label>[a-z])\b", text, re.IGNORECASE)
+    if author_match:
+        label = author_match.group("label")
+        affiliation_match = re.search(
+            rf"\b{re.escape(label)}\s+(?P<affiliation>.*?)(?=\s+[a-z]\s+[A-Z]| a r t i c l e| Article history|$)",
+            text,
+        )
+        if affiliation_match:
+            return affiliation_match.group("affiliation").strip(" ;,.")
+    fallback = re.search(
+        r"((?:Department|Centre|Center|Institute|School|Faculty)[^.;]*(?:University|Institute|Centre|Center)[^.;]*)",
+        text,
+        re.IGNORECASE,
+    )
+    return fallback.group(1).strip(" ;,.") if fallback else ""
+
+
+def _author_regex(author: str) -> str:
+    initials = re.findall(r"[A-Za-z]\.", author)
+    surname = re.search(r"([A-Za-z][A-Za-z-]+)$", author)
+    if not initials or not surname:
+        return re.escape(author)
+    initial_pattern = r"\s*".join(re.escape(initial.upper()) for initial in initials)
+    return rf"{initial_pattern}\s*{re.escape(surname.group(1))}"
 
 
 def _is_recoverable_llm_error(exc: Exception) -> bool:

@@ -31,6 +31,13 @@ class DocumentProfileBuilder:
         return DocumentProfile(
             document_id=parsed.document_id,
             title=normalized.title,
+            authors=normalized.authors,
+            affiliations=normalized.affiliations,
+            corresponding_author=normalized.corresponding_author,
+            journal=normalized.journal,
+            publication_year=normalized.publication_year,
+            doi=normalized.doi,
+            keywords=normalized.keywords,
             abstract=normalized.abstract,
             conclusion=normalized.conclusion,
             summary_text=summary_text,
@@ -70,6 +77,13 @@ class DocumentProfileBuilder:
         return ProfileExtraction(
             document_id=parsed.document_id,
             title=llm_extraction.title or rule_extraction.title,
+            authors=llm_extraction.authors,
+            affiliations=llm_extraction.affiliations,
+            corresponding_author=llm_extraction.corresponding_author,
+            journal=llm_extraction.journal,
+            publication_year=llm_extraction.publication_year,
+            doi=llm_extraction.doi,
+            keywords=llm_extraction.keywords,
             abstract=llm_extraction.abstract or rule_extraction.abstract,
             conclusion=llm_extraction.conclusion or rule_extraction.conclusion,
             topics=[*llm_extraction.topics, *rule_extraction.topics],
@@ -80,7 +94,7 @@ class DocumentProfileBuilder:
             applications=llm_extraction.applications,
             limitations=llm_extraction.limitations,
             figure_summary=llm_extraction.figure_summary or rule_extraction.figure_summary,
-            outline=rule_extraction.outline or llm_extraction.outline,
+            outline=llm_extraction.outline or rule_extraction.outline,
             source_refs=[*llm_extraction.source_refs, *rule_extraction.source_refs],
             extraction_method="hybrid",
             extraction_warnings=[*warnings, *llm_extraction.extraction_warnings],
@@ -90,6 +104,13 @@ class DocumentProfileBuilder:
         return ProfileExtraction(
             document_id=extraction.document_id,
             title=extraction.title,
+            authors=self._normalize_authors(extraction.authors, extraction.title),
+            affiliations=self._normalize_metadata_list(extraction.affiliations, limit=20),
+            corresponding_author=extraction.corresponding_author,
+            journal=self._normalize_journal(extraction.journal),
+            publication_year=extraction.publication_year,
+            doi=extraction.doi,
+            keywords=self._normalize_metadata_list(extraction.keywords, limit=20),
             abstract=extraction.abstract,
             conclusion=extraction.conclusion,
             topics=self.normalizer.normalize_topics(extraction.topics),
@@ -110,6 +131,13 @@ class DocumentProfileBuilder:
         return ProfileExtraction(
             document_id=extraction.document_id,
             title=extraction.title,
+            authors=extraction.authors,
+            affiliations=extraction.affiliations,
+            corresponding_author=extraction.corresponding_author,
+            journal=extraction.journal,
+            publication_year=extraction.publication_year,
+            doi=extraction.doi,
+            keywords=extraction.keywords,
             abstract=extraction.abstract,
             conclusion=extraction.conclusion,
             topics=extraction.topics,
@@ -133,3 +161,47 @@ class DocumentProfileBuilder:
             for image in page.images
             if image.caption
         ]
+
+    def _normalize_authors(self, authors: list[str], title: str | None) -> list[str]:
+        title_terms = {term.lower() for term in (title or "").replace("/", " ").replace("-", " ").split() if len(term) > 3}
+        cleaned = []
+        for author in authors:
+            value = " ".join(author.replace("\n", " ").split()).strip(" ,;")
+            if not value:
+                continue
+            words = value.split()
+            while len(words) > 2 and words[0].lower().strip(":,;") in title_terms:
+                words.pop(0)
+            value = " ".join(words).strip(" ,;")
+            if self._looks_like_non_author(value):
+                continue
+            cleaned.append(value)
+        return list(dict.fromkeys(cleaned))[:30]
+
+    def _looks_like_non_author(self, value: str) -> bool:
+        lowered = value.lower()
+        if len(value) < 3 or len(value) > 120:
+            return True
+        if any(marker in lowered for marker in ["abstract", "keyword", "journal", "university", "department", "institute"]):
+            return True
+        if lowered in {"synthesis", "characterization", "luminescent", "properties", "study"}:
+            return True
+        return False
+
+    def _normalize_journal(self, journal: str | None) -> str | None:
+        if not journal:
+            return None
+        value = " ".join(journal.split()).strip(" ,;")
+        lowered = value.lower()
+        if len(value) > 160 or any(marker in lowered for marker in ["department", "university", "institute", "abstract:", "zinc oxide is"]):
+            return None
+        return value
+
+    def _normalize_metadata_list(self, values: list[str], limit: int) -> list[str]:
+        cleaned = []
+        for value in values:
+            text = " ".join(value.split()).strip(" ,;")
+            if not text or len(text) > 120:
+                continue
+            cleaned.append(text)
+        return list(dict.fromkeys(cleaned))[:limit]

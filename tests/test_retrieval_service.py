@@ -1,12 +1,22 @@
 from backend.app.domain.documents import Evidence, EvidenceImage
 from backend.app.providers.embeddings import FakeEmbeddingProvider
-from backend.app.providers.rerankers import FakeRerankerProvider
+from backend.app.providers.rerankers import FakeRerankerProvider, RerankResult
 from backend.app.services.rag import RetrievalService
 
 
 class FailingReranker:
     def rerank(self, query, candidates, top_k):
         raise RuntimeError("model unavailable")
+
+
+class LexicalHostileReranker:
+    def rerank(self, query, candidates, top_k):
+        rows = []
+        for index, candidate in enumerate(candidates):
+            score = 10.0 if "unrelated" in candidate.text.lower() else 0.01
+            rows.append(RerankResult(candidate_id=candidate.candidate_id, score=score - index * 0.001))
+        rows.sort(key=lambda item: item.score, reverse=True)
+        return rows[:top_k]
 
 
 class VectorOnlyRepository:
@@ -64,6 +74,40 @@ class StrategyRepository:
         ]
 
 
+class HybridRepository:
+    def __init__(self) -> None:
+        self.lexical_calls = []
+
+    def search(self, query_embedding, top_k=5, document_ids=None, owner_id=None, search_strategy="hnsw", exact_timeout_ms=None):
+        return [
+            Evidence(
+                chunk_id="vector-general",
+                document_id="doc1",
+                text="General photovoltaic background.",
+                page_start=2,
+                page_end=2,
+                section_title="Introduction",
+                score=0.72,
+            )
+        ]
+
+    def search_lexical_chunks(self, query, top_k=5, document_ids=None, owner_id=None):
+        self.lexical_calls.append((query, top_k, document_ids, owner_id))
+        return [
+            Evidence(
+                chunk_id="author-hit",
+                document_id="doc1",
+                text="M.A. Eleruja b, Department of Physics, Obafemi Awolowo University.",
+                page_start=1,
+                page_end=1,
+                section_title="Title Page",
+                score=1.1,
+                evidence_type="lexical_chunk",
+                metadata={"retrieval_source": "lexical_chunk"},
+            )
+        ]
+
+
 def test_retrieval_service_embeds_before_vector_repository_search():
     repository = VectorOnlyRepository()
     provider = FakeEmbeddingProvider(dimensions=8)
@@ -101,6 +145,222 @@ def test_retrieve_uses_exact_then_hnsw_for_small_owner_scoped_candidate_sets():
     assert repository.calls[1] == ("search", ["doc1"], "tenant-a", "exact_then_hnsw", 250)
     assert service.last_recall_diagnostics["search_strategy"] == "exact_then_hnsw"
     assert service.last_recall_diagnostics["candidate_chunk_count"] == 3
+
+
+def test_retrieve_merges_lexical_hits_for_exact_fact_questions_without_reranker():
+    repository = HybridRepository()
+    service = RetrievalService(
+        repository,
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_enabled=False,
+        lexical_chunk_candidates=12,
+    )
+
+    results = service.retrieve("what M.A. Eleruja do in the paper?", top_k=2, document_ids=["doc1"], owner_id="tenant-a")
+
+    assert results[0].chunk_id == "author-hit"
+    assert repository.lexical_calls == [("what M.A. Eleruja do in the paper?", 12, ["doc1"], "tenant-a")]
+    assert service.last_recall_diagnostics["mode"] == "hybrid_chunk"
+    assert service.last_recall_diagnostics["vector_candidate_count"] == 1
+    assert service.last_recall_diagnostics["lexical_candidate_count"] == 1
+    assert results[0].metadata["retrieval_sources"] == ["lexical"]
+
+
+def test_retrieve_combines_duplicate_vector_and_lexical_candidates_before_rerank():
+    class DuplicateRepository(HybridRepository):
+        def search_lexical_chunks(self, query, top_k=5, document_ids=None, owner_id=None):
+            return [
+                Evidence(
+                    chunk_id="vector-general",
+                    document_id="doc1",
+                    text="General photovoltaic background with C. Ton-That reference.",
+                    page_start=2,
+                    page_end=2,
+                    section_title="References",
+                    score=1.2,
+                    evidence_type="lexical_chunk",
+                    metadata={"retrieval_source": "lexical_chunk"},
+                )
+            ]
+
+    service = RetrievalService(
+        DuplicateRepository(),
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_enabled=False,
+    )
+
+    results = service.retrieve("C. Ton-That reference number", top_k=5)
+
+    assert len(results) == 1
+    assert results[0].metadata["retrieval_sources"] == ["vector", "lexical"]
+    assert results[0].metadata["vector_score"] == 0.72
+    assert results[0].metadata["lexical_score"] == 1.2
+
+
+def test_retrieve_adds_figure_sidecar_for_visual_detail_questions():
+    class VisualHybridRepository(HybridRepository):
+        def search_figures(self, query_embedding, top_k=8, document_ids=None, owner_id=None):
+            return [
+                Evidence(
+                    chunk_id="figure:fig6",
+                    document_id="doc1",
+                    text="Fig. 6. Resonant spectra for TPP-ML/ZnO/Si(111), TPP/ZnO/Si(111), and TPP/ZnO/ITO.",
+                    page_start=6,
+                    page_end=6,
+                    section_title="Figure Index",
+                    score=0.95,
+                    evidence_type="figure",
+                    images=[EvidenceImage("fig6", page=6, caption="Fig. 6. Resonant spectra for TPP/ZnO systems.")],
+                )
+            ]
+
+    service = RetrievalService(
+        VisualHybridRepository(),
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_enabled=False,
+    )
+
+    results = service.retrieve("What material system is studied in the resonant spectra shown?", top_k=3)
+
+    assert any(item.chunk_id == "figure:fig6" for item in results)
+    assert service.last_recall_diagnostics["figure_sidecar_candidate_count"] == 1
+
+
+def test_retrieve_normalizes_known_scientific_ocr_noise_before_answering():
+    class OcrNoiseRepository(HybridRepository):
+        def search(self, query_embedding, top_k=5, document_ids=None, owner_id=None, search_strategy="hnsw", exact_timeout_ms=None):
+            return []
+
+        def search_figures(self, query_embedding, top_k=8, document_ids=None, owner_id=None):
+            return [
+                Evidence(
+                    chunk_id="figure:fig4",
+                    document_id="doc1",
+                    text="Fig. 4. ResPES spectra for TPP-ML/ZnO/S(111).",
+                    page_start=5,
+                    page_end=5,
+                    section_title="Figure Index",
+                    score=0.95,
+                    evidence_type="figure",
+                    images=[
+                        EvidenceImage(
+                            "fig4",
+                            page=5,
+                            caption="Fig. 4. TPP-ML/ZnO/S(111) monolayer.",
+                            nearby_text="TPP/ZnO/S(111) specimen.",
+                        )
+                    ],
+                )
+            ]
+
+    service = RetrievalService(
+        OcrNoiseRepository(),
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_enabled=False,
+    )
+
+    results = service.retrieve("What material system is in the resonant spectra?", top_k=3)
+
+    figure = next(item for item in results if item.chunk_id == "figure:fig4")
+    assert "TPP-ML/ZnO/Si(111)" in figure.text
+    assert "TPP-ML/ZnO/Si(111)" in figure.images[0].caption
+    assert "TPP/ZnO/Si(111)" in figure.images[0].nearby_text
+    assert figure.metadata["scientific_ocr_normalizations"] == ["zno_silicon_substrate_plane"]
+
+
+def test_retrieve_normalizes_figure_sidecar_when_it_replaces_top_k_result():
+    class SidecarReplacementRepository(HybridRepository):
+        def search(self, query_embedding, top_k=5, document_ids=None, owner_id=None, search_strategy="hnsw", exact_timeout_ms=None):
+            return [
+                Evidence(
+                    chunk_id="text-hit",
+                    document_id="doc1",
+                    text="Reference [21] discusses Ton-That work.",
+                    page_start=6,
+                    page_end=6,
+                    section_title="References",
+                    score=2.0,
+                )
+            ]
+
+        def search_lexical_chunks(self, query, top_k=5, document_ids=None, owner_id=None):
+            return []
+
+        def search_figures(self, query_embedding, top_k=8, document_ids=None, owner_id=None):
+            return [
+                Evidence(
+                    chunk_id="figure:fig4",
+                    document_id="doc1",
+                    text="Fig. 4. TPP-ML/ZnO/S(111) monolayer.",
+                    page_start=5,
+                    page_end=5,
+                    section_title="Figure Index",
+                    score=0.5,
+                    evidence_type="figure",
+                    images=[EvidenceImage("fig4", page=5, caption="Fig. 4. TPP-ML/ZnO/S(111) monolayer.")],
+                )
+            ]
+
+    service = RetrievalService(
+        SidecarReplacementRepository(),
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_enabled=False,
+    )
+
+    results = service.retrieve("What reference and resonant spectra material system are shown?", top_k=1)
+
+    assert results[0].chunk_id == "figure:fig4"
+    assert "TPP-ML/ZnO/Si(111)" in results[0].text
+    assert "TPP-ML/ZnO/Si(111)" in results[0].images[0].caption
+
+
+def test_rerank_preserves_strong_lexical_fact_hits_in_top_k():
+    class ManyCandidateHybridRepository(HybridRepository):
+        def search(self, query_embedding, top_k=5, document_ids=None, owner_id=None, search_strategy="hnsw", exact_timeout_ms=None):
+            return []
+
+        def search_lexical_chunks(self, query, top_k=5, document_ids=None, owner_id=None):
+            return [
+                Evidence(
+                    chunk_id="author-hit",
+                    document_id="doc1",
+                    text="M.A. Eleruja, Department of Physics, Obafemi Awolowo University.",
+                    page_start=1,
+                    page_end=1,
+                    section_title="Title Page",
+                    score=1.2,
+                    evidence_type="lexical_chunk",
+                    metadata={"retrieval_source": "lexical_chunk"},
+                ),
+                *[
+                    Evidence(
+                        chunk_id=f"noise-{index}",
+                        document_id="doc2",
+                        text=f"Unrelated photovoltaic background section {index}.",
+                        page_start=2,
+                        page_end=2,
+                        section_title="Background",
+                        score=1.1,
+                        evidence_type="lexical_chunk",
+                        metadata={"retrieval_source": "lexical_chunk"},
+                    )
+                    for index in range(4)
+                ],
+            ]
+
+    service = RetrievalService(
+        ManyCandidateHybridRepository(),
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_provider=LexicalHostileReranker(),
+        reranker_enabled=True,
+        reranker_min_candidates=1,
+        lexical_chunk_candidates=5,
+    )
+
+    results = service.retrieve("what M.A. Eleruja do in the paper?", top_k=2)
+
+    assert any(item.chunk_id == "author-hit" for item in results)
+    assert service.last_rerank_diagnostics["protected_lexical_count"] == 1
 
 
 def test_retrieve_uses_hnsw_for_large_owner_scoped_candidate_sets():

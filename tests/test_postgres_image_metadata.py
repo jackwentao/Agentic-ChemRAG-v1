@@ -70,6 +70,7 @@ def test_prepare_database_adds_image_metadata_columns():
     assert "ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS owner_id TEXT" in statements
     assert "ALTER TABLE document_profile_embeddings ADD COLUMN IF NOT EXISTS owner_id TEXT" in statements
     assert "CREATE INDEX IF NOT EXISTS chunks_owner_document_idx" in statements
+    assert "CREATE INDEX IF NOT EXISTS chunks_text_simple_tsv_idx" in statements
     assert "CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw_idx" in statements
     assert "CREATE INDEX IF NOT EXISTS figures_embedding_idx" in statements
     assert "CREATE INDEX IF NOT EXISTS document_profiles_embedding_idx" not in statements
@@ -173,6 +174,42 @@ def test_pgvector_repository_chunk_search_filters_by_owner_and_can_use_exact_tim
     assert "owner_id = :owner_id" in statements
     assert search_params["owner_id"] == "tenant-a"
     assert search_params["document_ids"] == ["doc1"]
+
+
+def test_pgvector_repository_lexical_chunk_search_filters_and_returns_evidence_type():
+    engine = FakeEngine()
+    engine.search_rows = [
+        {
+            "chunk_id": "c-ref",
+            "document_id": "doc1",
+            "text": "C. Ton-That is reference [21].",
+            "page_start": 6,
+            "page_end": 6,
+            "section_title": "References",
+            "score": 1.4,
+            "image_ids": [],
+            "images": [],
+        }
+    ]
+    repository = PgVectorRepository(engine)
+
+    evidence = repository.search_lexical_chunks(
+        "referense numbir for C. Ton-That",
+        top_k=3,
+        document_ids=["doc1"],
+        owner_id="tenant-a",
+    )
+
+    sql, params = engine.calls[-1]
+    assert evidence[0].chunk_id == "c-ref"
+    assert evidence[0].evidence_type == "lexical_chunk"
+    assert evidence[0].metadata["retrieval_source"] == "lexical_chunk"
+    assert "to_tsvector('simple', text)" in sql
+    assert "owner_id = :owner_id" in sql
+    assert params["owner_id"] == "tenant-a"
+    assert params["document_ids"] == ["doc1"]
+    assert "reference" in params["ts_query"]
+    assert "number" in params["ts_query"]
 
 
 def test_pgvector_repository_add_figures_and_search_returns_figure_evidence():

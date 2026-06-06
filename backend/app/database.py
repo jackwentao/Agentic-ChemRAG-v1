@@ -104,6 +104,7 @@ def prepare_database(engine: Engine) -> None:
         conn.execute(text("ALTER TABLE document_profile_embeddings ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo'"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS document_profile_embeddings_document_idx ON document_profile_embeddings (document_id, field_name)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS chunks_owner_document_idx ON chunks (owner_id, document_id, chunk_type)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS chunks_text_simple_tsv_idx ON chunks USING gin (to_tsvector('simple', text))"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS document_profiles_owner_document_idx ON document_profiles (owner_id, document_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS document_profile_embeddings_owner_document_idx ON document_profile_embeddings (owner_id, document_id, field_name)"))
         conn.execute(

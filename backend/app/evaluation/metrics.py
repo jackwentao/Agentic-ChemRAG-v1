@@ -99,6 +99,9 @@ def evaluate_case_metrics(
     metrics["answer_revision_applied"] = bool(answer_verification.get("revision_applied", False))
     metrics["unsupported_claim_count"] = int(answer_verification.get("unsupported_claim_count", 0) or 0)
     metrics["missing_disclosure_count"] = int(answer_verification.get("missing_disclosure_count", 0) or 0)
+    metrics["citation_error_count"] = int(answer_verification.get("citation_error_count", 0) or 0)
+    metrics["overstatement_count"] = int(answer_verification.get("overstatement_count", 0) or 0)
+    metrics["final_answer_accepted"] = _final_answer_accepted(metrics)
     metrics["total_tracked_llm_calls"] = (
         metrics["assessment_llm_calls"]
         + metrics["answer_llm_calls"]
@@ -107,6 +110,18 @@ def evaluate_case_metrics(
         + metrics["image_selection_llm_calls"]
     )
     return metrics
+
+
+def _final_answer_accepted(metrics: dict[str, Any]) -> bool:
+    if metrics["answer_verification_passed"]:
+        return True
+    if not metrics["answer_revision_applied"]:
+        return False
+    return (
+        metrics["unsupported_claim_count"] == 0
+        and metrics["missing_disclosure_count"] == 0
+        and metrics["overstatement_count"] == 0
+    )
 
 
 def ranking_metrics(

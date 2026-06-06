@@ -128,6 +128,9 @@ CREATE TABLE IF NOT EXISTS document_profiles (
 );
 
 ALTER TABLE document_profiles
+ADD COLUMN IF NOT EXISTS conclusion TEXT;
+
+ALTER TABLE document_profiles
 ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo';
 
 CREATE TABLE IF NOT EXISTS document_profile_embeddings (
@@ -184,6 +187,9 @@ ON chunks USING hnsw (embedding vector_cosine_ops);
 
 CREATE INDEX IF NOT EXISTS chunks_owner_document_idx
 ON chunks (owner_id, document_id, chunk_type);
+
+CREATE INDEX IF NOT EXISTS chunks_text_simple_tsv_idx
+ON chunks USING gin (to_tsvector('simple', text));
 
 CREATE INDEX IF NOT EXISTS document_profiles_owner_document_idx
 ON document_profiles (owner_id, document_id);

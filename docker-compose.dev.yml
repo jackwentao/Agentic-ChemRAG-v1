@@ -1,0 +1,75 @@
+services:
+  migrate:
+    volumes:
+      - ./backend:/app/backend
+      - ./migrations:/app/migrations
+      - ./scripts:/app/scripts
+      - ./alembic.ini:/app/alembic.ini
+      - ./storage/models:/app/storage/models
+
+  api:
+    environment:
+      ROUTER_WARMUP_ON_STARTUP: "false"
+      RERANKER_WARMUP_ON_STARTUP: "false"
+    command:
+      [
+        "python",
+        "-m",
+        "uvicorn",
+        "backend.app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--reload",
+        "--reload-dir",
+        "backend",
+        "--reload-dir",
+        "migrations",
+      ]
+    volumes:
+      - ./backend:/app/backend
+      - ./migrations:/app/migrations
+      - ./scripts:/app/scripts
+      - ./alembic.ini:/app/alembic.ini
+      - ./storage/models:/app/storage/models
+      - ./storage/uploads:/app/storage/uploads
+
+  worker:
+    environment:
+      ROUTER_WARMUP_ON_STARTUP: "false"
+      RERANKER_WARMUP_ON_STARTUP: "false"
+    command:
+      [
+        "watchfiles",
+        "--filter",
+        "python",
+        "celery -A backend.app.tasks.celery_app worker --loglevel=INFO --pool=solo",
+        "backend",
+        "migrations",
+      ]
+    volumes:
+      - ./backend:/app/backend
+      - ./migrations:/app/migrations
+      - ./scripts:/app/scripts
+      - ./alembic.ini:/app/alembic.ini
+      - ./storage/models:/app/storage/models
+      - ./storage/uploads:/app/storage/uploads
+
+  frontend-dev:
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  frontend_node_modules:

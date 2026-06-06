@@ -153,6 +153,37 @@ def test_deepseek_answer_falls_back_to_verified_evidence_when_connection_is_unav
     assert "520 nm" in answer
 
 
+def test_deepseek_answer_extracts_author_affiliation_without_external_call():
+    provider = DeepSeekLlmProvider.__new__(DeepSeekLlmProvider)
+    provider.model = "test-model"
+    provider.timeout_seconds = 2.0
+    provider.executor = RaisingExecutor(AssertionError("LLM should not be called for author detail fast path."))
+    provider.client = VerificationClient("{}")
+    evidence = Evidence(
+        chunk_id="title-page",
+        document_id="doc1",
+        text=(
+            "Band alignment and charge transport characteristics of TPP/ZnO hybrid for photovoltaic cell potential "
+            "B.A. Taleatu a,b,*, W.O. Makinde c, M.A. Eleruja b, A.Y. Fasasi c "
+            "a International Center for Theoretical Physics, Trieste, Italy "
+            "b Department of Physics, Obafemi Awolowo University, Ile-Ife, Osun, Nigeria "
+            "c Centre for Energy Research and Development, Obafemi Awolowo University, Ile-Ife, Nigeria"
+        ),
+        page_start=1,
+        page_end=1,
+        section_title="Document",
+        score=0.9,
+    )
+
+    answer = provider.answer_with_evidence("what M.A. Eleruja do in the paper?", [evidence])
+
+    assert "M.A. Eleruja" in answer
+    assert "co-author" in answer
+    assert "Department of Physics" in answer
+    assert "Obafemi Awolowo University" in answer
+    assert "does not specify an individual contribution" in answer
+
+
 def test_deepseek_profile_extractor_requests_structured_json():
     provider = DeepSeekLlmProvider.__new__(DeepSeekLlmProvider)
     provider.model = "test-model"

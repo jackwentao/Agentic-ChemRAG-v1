@@ -106,3 +106,53 @@ def test_chat_sessions_endpoint_lists_persisted_sessions():
 
     assert response.status_code == 200
     assert response.json()["sessions"][0]["title"] == "第一轮问题"
+
+
+def test_chat_stream_emits_answer_deltas_and_persists_messages():
+    class FakeRepository:
+        def list_indexed_document_ids(self, owner_id="demo"):
+            return ["doc1"]
+
+    class StreamingGraph:
+        def invoke(
+            self,
+            question,
+            document_ids=None,
+            scope=None,
+            session_id=None,
+            conversation_context=None,
+            answer_delta_callback=None,
+        ):
+            if answer_delta_callback is not None:
+                answer_delta_callback("hello ")
+                answer_delta_callback("world")
+            return {
+                "answer": "hello world",
+                "verified_evidence": [],
+                "selected_images": {},
+                "limitations": [],
+                "warnings": [],
+                "diagnostics": {"route": {"selected_route": "chunk_search"}, "stop_reason": "sufficient_evidence"},
+            }
+
+    repository = InMemoryConversationRepository()
+    app.state.conversation_repository = repository
+    app.dependency_overrides[dependencies.get_repository] = lambda: FakeRepository()
+    app.dependency_overrides[dependencies.get_rag_graph] = lambda: StreamingGraph()
+    client = TestClient(app)
+
+    with client.stream("POST", "/api/chat/stream", json={"question": "stream?", "scope": "all_documents"}) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "event: answer_delta" in body
+    assert '"delta": "hello "' in body
+    assert '"delta": "world"' in body
+    assert "event: final" in body
+    assert '"answer": "hello world"' in body
+
+    session_id = repository.list_sessions("demo")[0].session_id
+    messages = client.get(f"/api/chat/sessions/{session_id}/messages")
+    assert messages.status_code == 200
+    assert [message["role"] for message in messages.json()["messages"]] == ["user", "assistant"]
+    assert messages.json()["messages"][1]["content"] == "hello world"

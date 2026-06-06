@@ -81,6 +81,18 @@ def test_router_flags_multi_step_tasks():
     assert decision.needs_llm_router is True
 
 
+def test_router_keeps_reference_and_author_visual_mixed_questions_on_chunk_path():
+    decision = QueryRouter().route(
+        "What is the referense numbir for C. Ton-That's work in the list, and what materiel system is studied in the resonans spektra shown?",
+        RouteContext(scope="current_document", document_ids=["doc1"]),
+    )
+
+    assert decision.route == "chunk_search"
+    assert decision.is_multi_step is True
+    assert decision.needs_llm_router is True
+    assert "reference_or_author_detail_signal" in decision.rationale
+
+
 class StubEmbeddingProvider(EmbeddingProvider):
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return [self._vector(text) for text in texts]

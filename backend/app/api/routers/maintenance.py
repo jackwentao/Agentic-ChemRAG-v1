@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from backend.app.api.dependencies import DEFAULT_OWNER_ID, get_ingestion_task, get_readiness_service, get_repository
+from backend.app.config import Settings, get_settings
 from backend.app.repositories.postgres import PgVectorRepository
 from backend.app.schemas import ReadinessResponse, TaskStatusResponse
 from backend.app.services.readiness import ReadinessService
@@ -14,6 +15,11 @@ router = APIRouter(prefix="/api", tags=["maintenance"])
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@router.get("/version")
+def version(settings: Annotated[Settings, Depends(get_settings)]) -> dict[str, str]:
+    return {"app_version": settings.app_version}
 
 
 @router.get("/ready", response_model=ReadinessResponse, responses={503: {"model": ReadinessResponse}})

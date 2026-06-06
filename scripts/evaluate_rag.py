@@ -20,6 +20,12 @@ from backend.app.evaluation.metrics import (
     evaluate_case_metrics,
     summarize_latencies,
 )
+from backend.app.evaluation.ragas_adapter import (
+    RagasEvaluationConfig,
+    RagasEvaluator,
+    build_ragas_row,
+    merge_ragas_report,
+)
 from backend.app.providers.embeddings import build_embedding_provider
 from backend.app.providers.llm import ComposedLlmProvider, FakeLlmProvider, LlmProvider, build_llm_provider
 from backend.app.providers.rerankers import build_reranker_provider
@@ -76,11 +82,23 @@ def main() -> None:
         top_k=args.top_k,
         scope_override=None if args.scope == "from_case" else args.scope,
         judge=judge,
+        ragas_runner=_build_ragas_runner(
+            enabled=args.ragas == "on",
+            settings=settings,
+            embedding_provider=embedding_provider,
+            metric_set=args.ragas_metrics,
+            sample_limit=args.ragas_sample_limit,
+            max_context_chars=args.ragas_max_context_chars,
+            fail_on_error=args.ragas_fail_on_error == "on",
+        ),
+        ragas_max_context_chars=args.ragas_max_context_chars,
         warmup_info=warmup_info,
         evaluation_info={
             "answer_provider": args.answer_provider,
             "assessment_provider": args.assessment_provider,
             "llm_judge": args.llm_judge,
+            "ragas": args.ragas,
+            "ragas_metrics": args.ragas_metrics,
             "embedding_provider": settings.embedding_provider,
             "reranker_provider": settings.reranker_provider if settings.reranker_enabled else "disabled",
         },
@@ -96,10 +114,13 @@ def evaluate_cases(
     top_k: int = 5,
     scope_override: str | None = None,
     judge: LlmJudge | None = None,
+    ragas_runner=None,
+    ragas_max_context_chars: int = 4000,
     warmup_info: dict[str, Any] | None = None,
     evaluation_info: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
+    ragas_rows: list[dict[str, Any]] = []
     for case in cases:
         document_ids = _document_ids_for_case(case, scope_override)
         started_at = perf_counter()
@@ -169,11 +190,14 @@ def evaluate_cases(
             except Exception as exc:
                 result["judge_error"] = str(exc)
         results.append(result)
-    return {
+        ragas_rows.append(build_ragas_row(case, answer, evidence, max_context_chars=ragas_max_context_chars))
+    report = {
         "evaluation_info": evaluation_info or {
             "answer_provider": "unspecified",
             "assessment_provider": "unspecified",
             "llm_judge": "off",
+            "ragas": "off",
+            "ragas_metrics": "basic",
             "embedding_provider": "unspecified",
             "reranker_provider": "unspecified",
         },
@@ -181,6 +205,9 @@ def evaluate_cases(
         "summary": summarize_results(results),
         "results": results,
     }
+    if ragas_runner is not None:
+        return merge_ragas_report(report, ragas_runner.evaluate(ragas_rows))
+    return merge_ragas_report(report, None)
 
 
 def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -277,6 +304,7 @@ def render_markdown_report(report: dict[str, Any]) -> str:
     lines.extend(_failure_lines("图片未命中案例", results, lambda item: item["metrics"].get("figure_hit_mode") == "none"))
     lines.extend(_slowest_lines(results))
     lines.extend(_judge_low_score_lines(results))
+    lines.extend(_ragas_lines(report))
     return "\n".join(lines) + "\n"
 
 
@@ -295,7 +323,36 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--scope", choices=["current_document", "all_documents", "from_case"], default="from_case")
     parser.add_argument("--warmup", choices=["on", "off"], default="on")
+    parser.add_argument("--ragas", choices=["off", "on"], default="off")
+    parser.add_argument("--ragas-metrics", choices=["basic", "retrieval", "all"], default="basic")
+    parser.add_argument("--ragas-sample-limit", type=int, default=None)
+    parser.add_argument("--ragas-max-context-chars", type=int, default=4000)
+    parser.add_argument("--ragas-fail-on-error", choices=["off", "on"], default="off")
     return parser.parse_args()
+
+
+def _build_ragas_runner(
+    *,
+    enabled: bool,
+    settings,
+    embedding_provider,
+    metric_set: str,
+    sample_limit: int | None,
+    max_context_chars: int,
+    fail_on_error: bool,
+):
+    if not enabled:
+        return None
+    return RagasEvaluator(
+        settings=settings,
+        embedding_provider=embedding_provider,
+        config=RagasEvaluationConfig(
+            metric_set=metric_set,
+            sample_limit=sample_limit,
+            max_context_chars=max_context_chars,
+            fail_on_error=fail_on_error,
+        ),
+    )
 
 
 def _build_evaluation_llm_provider(
@@ -594,6 +651,43 @@ def _judge_low_score_lines(results: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _ragas_lines(report: dict[str, Any]) -> list[str]:
+    ragas = report.get("ragas", {})
+    lines = ["", "## Ragas LLM 评测", ""]
+    if not ragas.get("enabled", False):
+        return [*lines, "未启用。"]
+    errors = ragas.get("errors", [])
+    if errors:
+        lines.extend(["评测执行失败，基础 RAG 报告仍已生成。", ""])
+        for error in errors:
+            lines.append(f"- {error}")
+        return lines
+    summary = ragas.get("summary", {})
+    if not summary:
+        lines.append("无可展示的 Ragas 指标。")
+    else:
+        lines.extend(["| 指标 | 平均分 |", "| --- | ---: |"])
+        for metric, value in summary.items():
+            lines.append(f"| {_metric_label(metric)} | {_fmt(value)} |")
+    skipped = ragas.get("skipped_metrics", [])
+    if skipped:
+        lines.extend(["", "跳过指标："])
+        for metric in skipped:
+            lines.append(f"- `{metric}`：缺少 reference answer。")
+    low = []
+    for result in report.get("results", []):
+        metrics = result.get("ragas", {}).get("metrics", {})
+        low_scores = {name: value for name, value in metrics.items() if isinstance(value, (int, float)) and value < 0.6}
+        if low_scores:
+            low.append((result.get("case", {}).get("case_id"), low_scores))
+    if low:
+        lines.extend(["", "低分案例："])
+        for case_id, scores in low[:10]:
+            score_text = ", ".join(f"{_metric_label(name)}={_fmt(value)}" for name, value in scores.items())
+            lines.append(f"- `{case_id}` {score_text}")
+    return lines
+
+
 def _metric_label(name: str) -> str:
     labels = {
         "answer_llm_calls": "回答生成 LLM 调用数",
@@ -604,6 +698,7 @@ def _metric_label(name: str) -> str:
         "answer_verification_llm_calls": "答案核验 LLM 调用数",
         "answer_verification_passed": "答案核验通过率",
         "answer_verification_triggered": "答案核验触发率",
+        "final_answer_accepted": "最终答案接受率",
         "image_selection_llm_calls": "图片选择 LLM 调用数",
         "aspect_coverage_rate": "预期方面覆盖率",
         "assessment_llm_calls": "证据评估 LLM 调用数",
@@ -627,6 +722,8 @@ def _metric_label(name: str) -> str:
         "total_tracked_llm_calls": "已追踪 LLM 调用总数",
         "unsupported_claim_risk": "无引用结论风险率",
         "unsupported_claim_count": "未支撑断言数量",
+        "citation_error_count": "引用错误数量",
+        "overstatement_count": "过度表述数量",
         "wasted_retry": "无收益重试率",
         "latency_total_ms": "总时延（毫秒）",
         "latency_retrieval_ms": "检索时延（毫秒）",
@@ -643,6 +740,11 @@ def _metric_label(name: str) -> str:
         "average_answer_verification_llm_calls": "平均答案核验 LLM 调用数",
         "average_answer_revision_llm_calls": "平均答案修订 LLM 调用数",
         "average_image_selection_llm_calls": "平均图片选择 LLM 调用数",
+        "faithfulness": "Ragas 忠实性",
+        "answer_relevancy": "Ragas 回答相关性",
+        "context_precision": "Ragas 上下文精确率",
+        "context_recall": "Ragas 上下文召回率",
+        "answer_correctness": "Ragas 答案正确性",
     }
     if name in labels:
         return labels[name]

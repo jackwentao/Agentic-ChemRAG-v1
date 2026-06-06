@@ -3,18 +3,16 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.app.config import get_settings
-from backend.app.database import build_database_engine, prepare_database
+from alembic import command
+from alembic.config import Config
 
 
 def main() -> None:
-    """为部署流水线显式执行与应用启动一致的数据库准备步骤。"""
-    engine = build_database_engine(get_settings().database_url)
-    try:
-        prepare_database(engine)
-        print("数据库准备完成。")
-    finally:
-        engine.dispose()
+    """执行数据库版本化迁移。"""
+    project_root = Path(__file__).resolve().parents[1]
+    config = Config(str(project_root / "alembic.ini"))
+    command.upgrade(config, "head")
+    print("数据库迁移完成。")
 
 
 if __name__ == "__main__":

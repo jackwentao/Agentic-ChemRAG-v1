@@ -51,6 +51,22 @@ class FailingJudge:
         raise RuntimeError("judge unavailable")
 
 
+class FakeRagasRunner:
+    def __init__(self) -> None:
+        self.rows = []
+
+    def evaluate(self, rows):
+        self.rows = rows
+        return {
+            "enabled": True,
+            "summary": {"faithfulness": 0.8},
+            "metrics": ["faithfulness"],
+            "skipped_metrics": [],
+            "errors": [],
+            "results": [{"case_id": "c1", "metrics": {"faithfulness": 0.8}}],
+        }
+
+
 class RecordingEmbedding:
     def __init__(self) -> None:
         self.queries = []
@@ -157,6 +173,20 @@ def test_evaluate_cases_records_judge_errors_without_failing():
     report = evaluate_cases([make_case()], graph=FakeGraph(), top_k=5, judge=FailingJudge())
 
     assert report["results"][0]["judge_error"] == "judge unavailable"
+
+
+def test_evaluate_cases_merges_ragas_scores_and_passes_full_contexts():
+    ragas_runner = FakeRagasRunner()
+
+    report = evaluate_cases([make_case()], graph=FakeGraph(), top_k=5, ragas_runner=ragas_runner)
+
+    assert report["ragas"]["enabled"] is True
+    assert report["ragas"]["summary"] == {"faithfulness": 0.8}
+    assert report["results"][0]["ragas"]["metrics"]["faithfulness"] == 0.8
+    assert ragas_runner.rows[0]["case_id"] == "c1"
+    assert ragas_runner.rows[0]["user_input"] == "What figures are shown?"
+    assert ragas_runner.rows[0]["response"] == "Fig. 2 shows the PL spectrum of ZnO."
+    assert ragas_runner.rows[0]["retrieved_contexts"] == ["Fig. 2 PL spectrum of ZnO."]
 
 
 def test_render_markdown_report_includes_expected_sections():

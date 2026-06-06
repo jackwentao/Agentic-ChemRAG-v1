@@ -7,6 +7,13 @@ class ProfileTextRenderer:
     def render_summary_text(self, extraction: ProfileExtraction, parsed: ParsedDocument) -> str:
         summary_parts = [
             f"Title: {extraction.title}" if extraction.title else None,
+            f"Authors: {', '.join(extraction.authors)}" if extraction.authors else None,
+            f"Affiliations: {'; '.join(extraction.affiliations)}" if extraction.affiliations else None,
+            f"Corresponding author: {extraction.corresponding_author}" if extraction.corresponding_author else None,
+            f"Journal: {extraction.journal}" if extraction.journal else None,
+            f"Publication year: {extraction.publication_year}" if extraction.publication_year else None,
+            f"DOI: {extraction.doi}" if extraction.doi else None,
+            f"Keywords: {', '.join(extraction.keywords)}" if extraction.keywords else None,
             f"Abstract: {extraction.abstract}" if extraction.abstract else None,
             f"Conclusion: {extraction.conclusion}" if extraction.conclusion else None,
             f"Topics: {', '.join(extraction.topics)}" if extraction.topics else None,
@@ -24,6 +31,23 @@ class ProfileTextRenderer:
     def render_field_texts(self, profile: DocumentProfile) -> list[DocumentProfileField]:
         fields = [
             self._field(profile, "overview", profile.summary_text),
+            self._field(profile, "metadata_authors", ", ".join(profile.authors)),
+            self._field(profile, "metadata_affiliations", "; ".join(profile.affiliations)),
+            self._field(
+                profile,
+                "metadata_publication",
+                "; ".join(
+                    value
+                    for value in [
+                        profile.journal,
+                        str(profile.publication_year) if profile.publication_year else None,
+                        profile.doi,
+                        profile.corresponding_author,
+                    ]
+                    if value
+                ),
+            ),
+            self._field(profile, "metadata_keywords", ", ".join(profile.keywords)),
             self._field(profile, "abstract", profile.abstract),
             self._field(profile, "conclusion", profile.conclusion),
             self._field(profile, "topics", ", ".join(profile.topics)),

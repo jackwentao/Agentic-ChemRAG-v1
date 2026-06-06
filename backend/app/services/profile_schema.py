@@ -7,6 +7,13 @@ from backend.app.domain.documents import DocumentSection, SourceRef
 class ProfileExtraction:
     document_id: str
     title: str | None = None
+    authors: list[str] = field(default_factory=list)
+    affiliations: list[str] = field(default_factory=list)
+    corresponding_author: str | None = None
+    journal: str | None = None
+    publication_year: int | None = None
+    doi: str | None = None
+    keywords: list[str] = field(default_factory=list)
     abstract: str | None = None
     conclusion: str | None = None
     topics: list[str] = field(default_factory=list)

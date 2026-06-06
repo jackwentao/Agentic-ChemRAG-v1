@@ -140,6 +140,13 @@ class DocumentProfile:
     abstract: str | None
     conclusion: str | None
     summary_text: str
+    authors: list[str] = field(default_factory=list)
+    affiliations: list[str] = field(default_factory=list)
+    corresponding_author: str | None = None
+    journal: str | None = None
+    publication_year: int | None = None
+    doi: str | None = None
+    keywords: list[str] = field(default_factory=list)
     topics: list[str] = field(default_factory=list)
     entities: list[str] = field(default_factory=list)
     typed_entities: list[ProfileEntity] = field(default_factory=list)

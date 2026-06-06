@@ -1,5 +1,6 @@
 import json
 from dataclasses import asdict
+import re
 
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy import text
@@ -223,6 +224,27 @@ class PgVectorRepository:
             ).mappings().first()
         return dict(row) if row else None
 
+    def get_document_for_ingestion(self, document_id: str) -> dict[str, object] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT document_id,
+                           owner_id,
+                           COALESCE(original_filename, filename) AS filename,
+                           file_hash,
+                           file_size,
+                           pdf_object_key,
+                           indexing_status
+                    FROM documents
+                    WHERE document_id = :document_id
+                    LIMIT 1
+                    """
+                ),
+                {"document_id": document_id},
+            ).mappings().first()
+        return dict(row) if row else None
+
     def get_image_asset(self, image_id: str) -> dict[str, object] | None:
         with self.engine.begin() as conn:
             row = conn.execute(
@@ -429,6 +451,81 @@ class PgVectorRepository:
             exact_timeout_ms=exact_timeout_ms,
         )
 
+    def search_lexical_chunks(
+        self,
+        query: str,
+        top_k: int = 5,
+        document_ids: list[str] | None = None,
+        owner_id: str | None = None,
+    ) -> list[Evidence]:
+        terms = _lexical_terms(query)
+        if not terms:
+            return []
+        filter_parts, params = _ownership_filters(document_ids=document_ids, owner_id=owner_id)
+        term_filters = []
+        term_score_parts = []
+        for index, term in enumerate(terms[:8]):
+            key = f"term_{index}"
+            params[key] = f"%{term}%"
+            term_filters.append(f"text ILIKE :{key}")
+            term_score_parts.append(f"CASE WHEN text ILIKE :{key} THEN {_lexical_term_weight(term):.2f} ELSE 0 END")
+        ts_query = " ".join(terms[:12])
+        params["ts_query"] = ts_query
+        params["phrase"] = f"%{' '.join(terms[:4])}%"
+        params["top_k"] = top_k
+        where = " AND ".join(["chunk_type = 'child'", *filter_parts])
+        lexical_filter = " OR ".join(["to_tsvector('simple', text) @@ plainto_tsquery('simple', :ts_query)", *term_filters])
+        term_score = " + ".join(term_score_parts) if term_score_parts else "0"
+        sql = text(
+            f"""
+            WITH ranked AS (
+                SELECT chunk_id, document_id, text, page_start, page_end, section_title,
+                       (
+                           ts_rank_cd(to_tsvector('simple', text), plainto_tsquery('simple', :ts_query))
+                           + CASE WHEN text ILIKE :phrase THEN 1.00 ELSE 0 END
+                           + {term_score}
+                       ) AS score
+                FROM chunks
+                WHERE {where}
+                  AND ({lexical_filter})
+                ORDER BY score DESC, page_start ASC, chunk_id ASC
+                LIMIT :top_k
+            )
+            SELECT ranked.*,
+                   COALESCE(image_candidates.image_ids, ARRAY[]::text[]) AS image_ids,
+                   COALESCE(image_candidates.images, '[]'::jsonb) AS images
+            FROM ranked
+            LEFT JOIN LATERAL (
+                SELECT array_agg(limited.image_id ORDER BY limited.page, limited.image_id) AS image_ids,
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'image_id', limited.image_id,
+                               'page', limited.page,
+                               'width', limited.width,
+                               'height', limited.height,
+                               'label', limited.label,
+                               'caption', limited.caption,
+                               'nearby_text', limited.nearby_text
+                           )
+                           ORDER BY limited.page, limited.image_id
+                       ) AS images
+                FROM (
+                    SELECT image_id, page, width, height, label, caption, nearby_text
+                    FROM images
+                    WHERE images.document_id = ranked.document_id
+                      AND images.page BETWEEN ranked.page_start AND ranked.page_end
+                    ORDER BY images.page, images.image_id
+                    LIMIT 5
+                ) AS limited
+            ) AS image_candidates ON TRUE
+            ORDER BY ranked.score DESC, ranked.page_start ASC, ranked.chunk_id ASC
+            LIMIT :top_k
+            """
+        )
+        with self.engine.begin() as conn:
+            rows = conn.execute(sql, params).mappings().all()
+        return _chunk_rows_to_evidence(rows, evidence_type="lexical_chunk")
+
     def _search_chunks(
         self,
         query_embedding: list[float],
@@ -492,13 +589,7 @@ class PgVectorRepository:
             elif search_strategy == "hnsw":
                 conn.execute(text("SET LOCAL enable_seqscan = off"))
             rows = conn.execute(sql, params).mappings().all()
-        evidence = []
-        for row in rows:
-            data = dict(row)
-            images = data.pop("images") or []
-            data["images"] = [EvidenceImage(**dict(image)) for image in images]
-            evidence.append(Evidence(**data))
-        return evidence
+        return _chunk_rows_to_evidence(rows)
 
     def search_figures(
         self,
@@ -733,6 +824,7 @@ class PgVectorRepository:
                         "figure_summary": profile.get("figure_summary"),
                         "outline": _json_value(profile.get("outline_json"), []),
                         "profile": _json_value(profile.get("profile_json"), {}),
+                        **_metadata_from_profile_json(profile.get("profile_json")),
                     },
                 )
             )
@@ -811,11 +903,101 @@ def _ownership_filters(
     return filters, params
 
 
+def _chunk_rows_to_evidence(rows, evidence_type: str = "chunk") -> list[Evidence]:
+    evidence = []
+    for row in rows:
+        data = dict(row)
+        images = data.pop("images") or []
+        data["images"] = [EvidenceImage(**dict(image)) for image in images]
+        data["evidence_type"] = evidence_type
+        data["metadata"] = {
+            **(data.get("metadata") if isinstance(data.get("metadata"), dict) else {}),
+            "retrieval_source": evidence_type,
+        }
+        evidence.append(Evidence(**data))
+    return evidence
+
+
+def _lexical_terms(query: str) -> list[str]:
+    aliases = {
+        "referense": "reference",
+        "numbir": "number",
+        "materiel": "material",
+        "resonans": "resonance",
+        "spektra": "spectra",
+        "potenshal": "potential",
+        "soler": "solar",
+        "energjy": "energy",
+        "renewabel": "renewable",
+        "discribed": "described",
+    }
+    normalized = query.lower()
+    for typo, correction in aliases.items():
+        normalized = normalized.replace(typo, correction)
+    raw_terms = re.findall(r"[a-z][a-z0-9.-]{1,}|[\u4e00-\u9fff]{2,}", normalized)
+    stopwords = {
+        "what",
+        "which",
+        "where",
+        "when",
+        "how",
+        "does",
+        "with",
+        "from",
+        "into",
+        "that",
+        "this",
+        "paper",
+        "article",
+        "shown",
+        "list",
+        "work",
+        "material",
+        "system",
+        "studied",
+        "study",
+    }
+    terms: list[str] = []
+    for raw in raw_terms:
+        term = raw.strip(".-")
+        if len(term) < 2 or term in stopwords:
+            continue
+        if "." in term:
+            parts = [part for part in term.split(".") if len(part) >= 2]
+            if parts:
+                for part in parts:
+                    if part not in stopwords and part not in terms:
+                        terms.append(part)
+                continue
+        if term not in terms:
+            terms.append(term)
+    return terms
+
+
+def _lexical_term_weight(term: str) -> float:
+    if "-" in term or "/" in term:
+        return 1.40
+    if re.search(r"[a-z]+\d|\d+[a-z]+", term):
+        return 0.85
+    if len(term) >= 7 and term not in {"spectra", "reference"}:
+        return 0.55
+    if term in {"reference", "number", "author", "affiliation", "department"}:
+        return 0.35
+    return 0.20
+
+
 def _profile_payload(profile: DocumentProfile) -> dict[str, object]:
     return {
         "document_id": profile.document_id,
         "owner_id": profile.owner_id,
         "title": profile.title,
+        "authors": profile.authors,
+        "affiliations": profile.affiliations,
+        "corresponding_author": profile.corresponding_author,
+        "journal": profile.journal,
+        "publication_year": profile.publication_year,
+        "doi": profile.doi,
+        "keywords": profile.keywords,
         "abstract": profile.abstract,
         "conclusion": profile.conclusion,
         "topics": profile.topics,
@@ -833,6 +1015,14 @@ def _profile_payload(profile: DocumentProfile) -> dict[str, object]:
 
 def _profile_field_id(document_id: str, field_name: str) -> str:
     return f"{document_id}:{field_name}"
+
+
+def _metadata_from_profile_json(value) -> dict[str, object]:
+    profile = _json_value(value, {})
+    if not isinstance(profile, dict):
+        return {}
+    keys = ["authors", "affiliations", "corresponding_author", "journal", "publication_year", "doi", "keywords"]
+    return {key: profile.get(key) for key in keys if key in profile}
 
 
 def _source_refs_from_profile_row(profile: dict) -> list[SourceRef]:

@@ -229,6 +229,78 @@ def test_adaptive_retrieval_metrics_report_retry_gain_disclosure_and_cost():
     assert metrics["total_tracked_llm_calls"] == 4
 
 
+def test_final_answer_accepted_allows_revision_to_fix_citation_errors():
+    case = GoldenCase(
+        case_id="verification",
+        question="Which material system is shown?",
+        scope="current_document",
+        document_ids=["doc1"],
+        expected_route="chunk_search",
+        target_type="page",
+        expected_pages=[5],
+        answer_type="fact_qa",
+    )
+
+    metrics = evaluate_case_metrics(
+        case,
+        "chunk_search",
+        [Evidence("c1", "doc1", "TPP/ZnO/Si(111)", 5, 5, "Figure", 0.9)],
+        "TPP/ZnO/S(111)",
+        [{"page_start": 5, "page_end": 5, "source_url": "/api/documents/doc1/pdf#page=5"}],
+        [],
+        top_k=5,
+        retrieval_round=1,
+        stop_reason="sufficient_evidence",
+        answer_verification={
+            "passed": False,
+            "revision_applied": True,
+            "unsupported_claim_count": 0,
+            "missing_disclosure_count": 0,
+            "citation_error_count": 1,
+            "overstatement_count": 0,
+        },
+    )
+
+    assert metrics["answer_revision_applied"] is True
+    assert metrics["citation_error_count"] == 1
+    assert metrics["final_answer_accepted"] is True
+
+
+def test_final_answer_accepted_rejects_unrevised_verification_errors():
+    case = GoldenCase(
+        case_id="verification",
+        question="Which material system is shown?",
+        scope="current_document",
+        document_ids=["doc1"],
+        expected_route="chunk_search",
+        target_type="page",
+        expected_pages=[5],
+        answer_type="fact_qa",
+    )
+
+    metrics = evaluate_case_metrics(
+        case,
+        "chunk_search",
+        [Evidence("c1", "doc1", "TPP/ZnO/Si(111)", 5, 5, "Figure", 0.9)],
+        "TPP/ZnO/S(111)",
+        [{"page_start": 5, "page_end": 5, "source_url": "/api/documents/doc1/pdf#page=5"}],
+        [],
+        top_k=5,
+        retrieval_round=1,
+        stop_reason="sufficient_evidence",
+        answer_verification={
+            "passed": False,
+            "revision_applied": False,
+            "unsupported_claim_count": 0,
+            "missing_disclosure_count": 0,
+            "citation_error_count": 1,
+            "overstatement_count": 0,
+        },
+    )
+
+    assert metrics["final_answer_accepted"] is False
+
+
 def test_latency_summary_reports_p50_p95_and_max():
     summary = summarize_latencies(
         [
