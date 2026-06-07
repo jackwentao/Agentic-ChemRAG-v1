@@ -20,13 +20,21 @@ class CaptionCandidate:
 
 
 class PyMuPDFParser(DocumentParser):
-    def __init__(self, max_rendered_caption_crops_per_page: int = 2) -> None:
+    def __init__(
+        self,
+        max_rendered_caption_crops_per_page: int = 2,
+        max_extracted_images: int = 500,
+        max_image_bytes: int = 20 * 1024 * 1024,
+    ) -> None:
         self.max_rendered_caption_crops_per_page = max_rendered_caption_crops_per_page
+        self.max_extracted_images = max_extracted_images
+        self.max_image_bytes = max_image_bytes
 
     def parse(self, document_id: str, file_path: Path) -> ParsedDocument:
         import fitz
 
         pages: list[ParsedPage] = []
+        extracted_image_count = 0
         with fitz.open(file_path) as pdf:
             for page_index, page in enumerate(pdf, start=1):
                 text = self._clean_text(page.get_text("text") or "")
@@ -37,15 +45,21 @@ class PyMuPDFParser(DocumentParser):
                 kept_image_index = 0
 
                 for image_index, image in enumerate(page.get_images(full=True), start=1):
+                    if extracted_image_count >= self.max_extracted_images:
+                        break
                     xref = image[0]
                     extracted = pdf.extract_image(xref)
                     width = extracted.get("width")
                     height = extracted.get("height")
-                    if self._is_tiny_image(width, height, len(extracted["image"])):
+                    image_bytes = extracted["image"]
+                    if len(image_bytes) > self.max_image_bytes:
+                        continue
+                    if self._is_tiny_image(width, height, len(image_bytes)):
                         continue
 
                     rect = self._first_image_rect(page, xref)
                     kept_image_index += 1
+                    extracted_image_count += 1
                     caption_index = self._nearest_caption_index(rect, captions, used_caption_indexes)
                     if caption_index is not None:
                         used_caption_indexes.add(caption_index)
@@ -59,7 +73,7 @@ class PyMuPDFParser(DocumentParser):
                             page=page_index,
                             index=image_index,
                             extension=extracted.get("ext", "png"),
-                            bytes_data=extracted["image"],
+                            bytes_data=image_bytes,
                             width=width,
                             height=height,
                             label=context.get("label"),
@@ -80,6 +94,8 @@ class PyMuPDFParser(DocumentParser):
                         fallback_text=text,
                     )
                 )
+                if self.max_extracted_images >= 0 and len(images) > self.max_extracted_images:
+                    images = images[: self.max_extracted_images]
                 pages.append(ParsedPage(page=page_index, text=text, images=images))
         return ParsedDocument(document_id=document_id, filename=file_path.name, pages=pages)
 

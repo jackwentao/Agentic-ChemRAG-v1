@@ -295,8 +295,15 @@ def test_chat_response_includes_selected_citation_images():
     assert payload["diagnostics"]["stop_reason"] == "sufficient_evidence"
     assert payload["diagnostics"]["retrieval_rounds"][0]["new_evidence_count"] == 1
     assert payload["diagnostics"]["assessment_rounds"][0]["sufficient"] is True
-    assert payload["diagnostics"]["llm_call_counts"] == {"evidence_assessment": 0, "answer_generation": 0}
+    assert payload["diagnostics"]["llm_call_counts"] == {
+        "evidence_assessment": 0,
+        "answer_generation": 0,
+        "answer_verification": 0,
+        "answer_revision": 0,
+        "image_selection": 0,
+    }
     assert payload["diagnostics"]["llm"]["proxy_hit"] is True
+    assert payload["diagnostics"]["image_selection"]["used_llm"] is False
 
 
 def test_chat_response_exposes_evidence_limitations():

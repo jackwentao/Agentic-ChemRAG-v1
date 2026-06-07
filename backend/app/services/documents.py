@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from backend.app.schemas import DocumentSummary, DocumentUploadResponse
 from backend.app.services.object_storage import ObjectStorage, document_pdf_key
+from backend.app.services.upload_validation import ValidatedUpload
 
 
 class DocumentService:
@@ -64,6 +65,42 @@ class DocumentService:
         )
         return self._enqueue_ingestion(document_id, target, filename, file_hash, file_size)
 
+    def store_uploaded_pdf_file(self, upload: ValidatedUpload) -> DocumentUploadResponse:
+        existing = self.repository.find_document_by_hash(self.owner_id, upload.file_hash)
+        if existing is not None:
+            document_id = str(existing["document_id"])
+            pdf_key = document_pdf_key(document_id)
+            self._store_pdf_file(pdf_key, upload.path)
+            self.repository.update_document_hash(
+                document_id,
+                upload.file_hash,
+                upload.file_size,
+                upload.filename,
+                pdf_object_key=pdf_key,
+            )
+            if bool(existing["is_indexed"]):
+                return DocumentUploadResponse(document_id=document_id, task_id=None, status="already_indexed", reused=True)
+            indexing_status = str(existing.get("indexing_status") or "pending")
+            if indexing_status in {"pending", "running"}:
+                return DocumentUploadResponse(document_id=document_id, task_id=None, status=indexing_status, reused=True)
+            self.repository.update_document_indexing_status(document_id, "pending")
+            return self._enqueue_ingestion(document_id, upload.path, upload.filename, upload.file_hash, upload.file_size, reused=True)
+
+        document_id = uuid4().hex
+        pdf_key = document_pdf_key(document_id)
+        self._store_pdf_file(pdf_key, upload.path)
+        self.repository.add_document(
+            document_id,
+            upload.filename,
+            owner_id=self.owner_id,
+            file_hash=upload.file_hash,
+            file_size=upload.file_size,
+            original_filename=upload.filename,
+            indexing_status="pending",
+            pdf_object_key=pdf_key,
+        )
+        return self._enqueue_ingestion(document_id, upload.path, upload.filename, upload.file_hash, upload.file_size)
+
     def list_documents(self) -> list[DocumentSummary]:
         rows = self.repository.list_documents(owner_id=self.owner_id)
         return [
@@ -118,7 +155,7 @@ class DocumentService:
         reused: bool = False,
     ) -> DocumentUploadResponse:
         try:
-            task = self.ingestion_task.delay(document_id, str(target), filename, file_hash, file_size)
+            task = self.ingestion_task.delay(document_id)
         except Exception as exc:
             error = f"Failed to enqueue ingestion task: {exc}"
             self.repository.update_document_indexing_status(document_id, "failed", error=error)
@@ -127,3 +164,6 @@ class DocumentService:
 
     def _store_pdf_object(self, pdf_key: str, content: bytes) -> None:
         self.object_storage.put_bytes(pdf_key, content, content_type="application/pdf")
+
+    def _store_pdf_file(self, pdf_key: str, path: Path) -> None:
+        self.object_storage.put_file(pdf_key, path, content_type="application/pdf")

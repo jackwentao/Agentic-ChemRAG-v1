@@ -127,7 +127,7 @@ class QueryRouter:
         top_route, top_score = ranked[0]
         second_score = ranked[1][1] if len(ranked) > 1 else 0.0
         confidence = round(top_score - second_score, 6)
-        is_multi_step = _is_multi_step(normalized)
+        is_multi_step = _is_multi_step(normalized) or _is_reference_visual_mixed_question(normalized)
         out_of_domain = "likely_out_of_domain_low_confidence" in rationale
         if is_multi_step:
             rationale.append("multi_step_signal")
@@ -243,6 +243,31 @@ class QueryRouter:
         if figure_local_fact:
             scores["chunk_search"] += 0.65
             rationale.append("figure_local_fact_question")
+
+        reference_detail_signal = _has_any(
+            normalized,
+            [
+                "reference number",
+                "reference list",
+                "author",
+                "co-author",
+                "affiliation",
+                "department",
+                "journal",
+                "doi",
+                "citation",
+                "cited",
+                "参考文献",
+                "作者",
+                "单位",
+                "机构",
+                "编号",
+            ],
+        )
+        if reference_detail_signal:
+            scores["chunk_search"] += 0.82
+            scores["figure_index"] = max(0.0, scores["figure_index"] - 0.22)
+            rationale.append("reference_or_author_detail_signal")
 
         strong_summary_signal = _has_any(
             normalized,
@@ -541,7 +566,22 @@ def _provider_fingerprint(provider: EmbeddingProvider | None) -> str:
 
 
 def _normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip().lower()
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    aliases = {
+        "referense": "reference",
+        "numbir": "number",
+        "materiel": "material",
+        "resonans": "resonance",
+        "spektra": "spectra",
+        "potenshal": "potential",
+        "soler": "solar",
+        "energjy": "energy",
+        "renewabel": "renewable",
+        "discribed": "described",
+    }
+    for typo, correction in aliases.items():
+        normalized = normalized.replace(typo, correction)
+    return normalized
 
 
 def _has_any(text: str, phrases: list[str]) -> bool:
@@ -563,6 +603,18 @@ def _is_multi_step(normalized: str) -> bool:
         re.search(r"\b(?:compare|then|and summarize|summarize their|find .* and |list .* and )\b", normalized)
         or re.search(r"先.*再|找出.*并|比较.*总结|筛选.*总结|列出.*并", normalized)
     )
+
+
+def _is_reference_visual_mixed_question(normalized: str) -> bool:
+    reference_signal = _has_any(
+        normalized,
+        ["reference", "citation", "author", "co-author", "affiliation", "department", "参考文献", "作者", "单位", "机构"],
+    )
+    visual_signal = _has_any(
+        normalized,
+        ["figure", "fig.", "plot", "spectrum", "spectra", "resonance", "图", "谱图", "曲线"],
+    )
+    return reference_signal and visual_signal
 
 
 def _cosine(left: list[float], right: list[float]) -> float:

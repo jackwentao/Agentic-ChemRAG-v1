@@ -8,6 +8,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+!.env.docker.example
 storage/
 
 frontend/node_modules/
@@ -18,6 +19,7 @@ frontend/dist/
 *.pyd
 *.log
 *.pdf
+Agentic_ChemRAG项目演示.mp4
 .coverage
 coverage.xml
 htmlcov/

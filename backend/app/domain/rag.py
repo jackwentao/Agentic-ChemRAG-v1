@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Literal
 
+from backend.app.domain.documents import EvidenceImage
+
 
 StopReason = Literal[
     "sufficient_evidence",
@@ -72,8 +74,28 @@ class EvidenceAssessment:
 
 @dataclass(frozen=True)
 class AnswerVerification:
-    # 这里预留了答案级校验结构，方便未来在生成答案后再做一次 claim check。
+    # 答案级核验只检查最终答案是否忠实于已验证证据，不负责自由生成新答案。
     passed: bool
+    triggered: bool = False
+    trigger_reasons: list[str] = field(default_factory=list)
     unsupported_claims: list[str] = field(default_factory=list)
     missing_disclosures: list[str] = field(default_factory=list)
+    citation_errors: list[str] = field(default_factory=list)
+    overstatements: list[str] = field(default_factory=list)
     revision_instruction: str | None = None
+    used_llm: bool = False
+    fallback_used: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ImageSelectionResult:
+    # 图片选择结果同时携带诊断信息，避免编排层猜测 provider 是否实际调用模型。
+    images: dict[str, list[EvidenceImage]] = field(default_factory=dict)
+    strategy: str = "none"
+    used_llm: bool = False
+    fallback_used: bool = False
+    candidate_count: int = 0
+    selected_count: int = 0
+    latency_ms: float = 0.0
+    reason: str = ""

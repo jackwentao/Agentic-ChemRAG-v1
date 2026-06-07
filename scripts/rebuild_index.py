@@ -9,7 +9,9 @@ from backend.app.database import build_database_engine
 from backend.app.parsing.chunker import ParentChildChunker
 from backend.app.parsing.parser import PyMuPDFParser
 from backend.app.providers.embeddings import build_embedding_provider
+from backend.app.providers.llm import build_llm_provider
 from backend.app.repositories.postgres import PgVectorRepository
+from backend.app.services.document_profile import DocumentProfileBuilder
 from backend.app.services.image_store import ObjectImageStore
 from backend.app.services.ingestion import IngestionService
 from backend.app.services.object_storage import build_object_storage
@@ -48,6 +50,7 @@ def main() -> None:
         embedding_provider=build_embedding_provider(settings),
         repository=repository,
         image_store=ObjectImageStore(build_object_storage(settings)),
+        profile_builder=DocumentProfileBuilder(llm_provider=_build_optional_profile_llm_provider(settings)),
     )
 
     succeeded = 0
@@ -119,6 +122,15 @@ def _delete_document_derived_data(engine, document_id: str) -> None:
         conn.execute(text("DELETE FROM document_profiles WHERE document_id = :document_id"), {"document_id": document_id})
         conn.execute(text("DELETE FROM images WHERE document_id = :document_id"), {"document_id": document_id})
         conn.execute(text("DELETE FROM chunks WHERE document_id = :document_id"), {"document_id": document_id})
+
+
+def _build_optional_profile_llm_provider(settings):
+    if not settings.llm_profile_extraction_enabled:
+        return None
+    try:
+        return build_llm_provider(settings)
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":

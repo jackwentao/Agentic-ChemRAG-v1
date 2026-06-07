@@ -129,6 +129,7 @@ def test_source_url_validation_rejects_missing_or_non_pdf_page_urls():
         [{"source_url": "/api/documents/doc1/pdf#page=2"}],
         [{"source_url": "/api/documents/doc1/pdf#page=3"}],
     )
+    assert source_urls_valid([{"source_url": None, "source_scope": "document_level"}], [])
     assert not source_urls_valid([{"source_url": "/api/images/img1"}], [])
     assert not source_urls_valid([], [{"image_id": "img1"}])
 
@@ -214,7 +215,7 @@ def test_adaptive_retrieval_metrics_report_retry_gain_disclosure_and_cost():
         retrieval_round=2,
         stop_reason="sufficient_evidence",
         assessment_rounds=[{"round_index": 1}, {"round_index": 2}],
-        llm_call_counts={"evidence_assessment": 2, "answer_generation": 1},
+        llm_call_counts={"evidence_assessment": 2, "answer_generation": 1, "image_selection": 1},
     )
 
     assert metrics["retry_triggered"] is True
@@ -224,7 +225,80 @@ def test_adaptive_retrieval_metrics_report_retry_gain_disclosure_and_cost():
     assert metrics["limitation_disclosure_hit"] is True
     assert metrics["aspect_coverage_rate"] == 1.0
     assert metrics["assessment_round_count"] == 2
-    assert metrics["total_tracked_llm_calls"] == 3
+    assert metrics["image_selection_llm_calls"] == 1
+    assert metrics["total_tracked_llm_calls"] == 4
+
+
+def test_final_answer_accepted_allows_revision_to_fix_citation_errors():
+    case = GoldenCase(
+        case_id="verification",
+        question="Which material system is shown?",
+        scope="current_document",
+        document_ids=["doc1"],
+        expected_route="chunk_search",
+        target_type="page",
+        expected_pages=[5],
+        answer_type="fact_qa",
+    )
+
+    metrics = evaluate_case_metrics(
+        case,
+        "chunk_search",
+        [Evidence("c1", "doc1", "TPP/ZnO/Si(111)", 5, 5, "Figure", 0.9)],
+        "TPP/ZnO/S(111)",
+        [{"page_start": 5, "page_end": 5, "source_url": "/api/documents/doc1/pdf#page=5"}],
+        [],
+        top_k=5,
+        retrieval_round=1,
+        stop_reason="sufficient_evidence",
+        answer_verification={
+            "passed": False,
+            "revision_applied": True,
+            "unsupported_claim_count": 0,
+            "missing_disclosure_count": 0,
+            "citation_error_count": 1,
+            "overstatement_count": 0,
+        },
+    )
+
+    assert metrics["answer_revision_applied"] is True
+    assert metrics["citation_error_count"] == 1
+    assert metrics["final_answer_accepted"] is True
+
+
+def test_final_answer_accepted_rejects_unrevised_verification_errors():
+    case = GoldenCase(
+        case_id="verification",
+        question="Which material system is shown?",
+        scope="current_document",
+        document_ids=["doc1"],
+        expected_route="chunk_search",
+        target_type="page",
+        expected_pages=[5],
+        answer_type="fact_qa",
+    )
+
+    metrics = evaluate_case_metrics(
+        case,
+        "chunk_search",
+        [Evidence("c1", "doc1", "TPP/ZnO/Si(111)", 5, 5, "Figure", 0.9)],
+        "TPP/ZnO/S(111)",
+        [{"page_start": 5, "page_end": 5, "source_url": "/api/documents/doc1/pdf#page=5"}],
+        [],
+        top_k=5,
+        retrieval_round=1,
+        stop_reason="sufficient_evidence",
+        answer_verification={
+            "passed": False,
+            "revision_applied": False,
+            "unsupported_claim_count": 0,
+            "missing_disclosure_count": 0,
+            "citation_error_count": 1,
+            "overstatement_count": 0,
+        },
+    )
+
+    assert metrics["final_answer_accepted"] is False
 
 
 def test_latency_summary_reports_p50_p95_and_max():

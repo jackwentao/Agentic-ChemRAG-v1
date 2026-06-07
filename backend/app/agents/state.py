@@ -1,7 +1,9 @@
+from collections.abc import Callable
 from typing import TypedDict
 
 from backend.app.domain.documents import Evidence, EvidenceImage
 from backend.app.domain.rag import AnswerVerification, EvidenceAssessment, QueryPlan, RoutePlan, StopReason, TaskDecision
+from backend.app.retrieval.outline_resolution import OutlineReferenceResolution
 
 
 class RagGraphState(TypedDict, total=False):
@@ -10,9 +12,11 @@ class RagGraphState(TypedDict, total=False):
     question: str
     original_question: str
     session_id: str | None
+    owner_id: str | None
     conversation_context: str | None
     document_ids: list[str] | None
     scope: str | None
+    outline_resolution: OutlineReferenceResolution | None
     task_decision: TaskDecision | None
     route_plan: RoutePlan | None
     current_step_index: int
@@ -38,6 +42,7 @@ class RagGraphState(TypedDict, total=False):
     # evidence 表示当前轮检索结果；accumulated_evidence 表示跨轮累积结果。
     # 两者分离后，控制器就能判断“本轮是否新增证据”和“总体证据是否足够回答”。
     evidence: list[Evidence]
+    outline_context_evidence: list[Evidence]
     accumulated_evidence: list[Evidence]
     current_new_evidence_count: int
     retrieval_history: list[dict[str, object]]
@@ -53,8 +58,12 @@ class RagGraphState(TypedDict, total=False):
     verification_latency_ms: float
     selected_images: dict[str, list[EvidenceImage]]
     answer: str
+    answer_delta_callback: Callable[[str], None] | None
+    stage_callback: Callable[[str, str], None] | None
     limitations: list[str]
     answer_verification: AnswerVerification | None
+    answer_verification_latency_ms: float
+    answer_revision_count: int
     total_latency_ms: float
     retrieval_latency_ms: float
     rerank_latency_ms: float

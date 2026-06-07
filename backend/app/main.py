@@ -2,12 +2,18 @@ from contextlib import asynccontextmanager
 import logging
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
+from backend.app.api.error_handlers import handle_domain_error, handle_unexpected_error, handle_validation_error
 from backend.app.api.dependencies import get_query_router, get_reranker_provider
 from backend.app.api.routers import assets, chat, documents, maintenance
 from backend.app.config import get_settings
 from backend.app.database import build_database_engine, prepare_database
+from backend.app.domain.errors import DomainError
+from backend.app.observability.metrics import MetricsMiddleware, render_metrics
+from backend.app.observability.request_id import RequestIdMiddleware
 from backend.app.repositories.conversation import PgConversationRepository
 from backend.app.repositories.postgres import PgVectorRepository
 
@@ -45,7 +51,8 @@ async def lifespan(app: FastAPI):
     # 这样 API 层只关心依赖注入，不直接承担基础设施编排逻辑。
     engine = build_database_engine(settings.database_url)
     try:
-        prepare_database(engine)
+        if settings.database_auto_prepare:
+            prepare_database(engine)
         app.state.repository = PgVectorRepository(engine)
         app.state.conversation_repository = PgConversationRepository(engine)
         warmup_router_on_startup()
@@ -60,6 +67,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
+app.add_exception_handler(DomainError, handle_domain_error)
+app.add_exception_handler(RequestValidationError, handle_validation_error)
+app.add_exception_handler(Exception, handle_unexpected_error)
+app.add_middleware(RequestIdMiddleware, header_name=settings.request_id_header)
+if settings.metrics_enabled:
+    app.add_middleware(MetricsMiddleware)
 
 # 这里使用最宽松的 CORS 配置，便于本地前后端联调；如果走生产部署，建议收紧来源名单。
 app.add_middleware(
@@ -74,3 +87,8 @@ app.include_router(documents.router)
 app.include_router(chat.router)
 app.include_router(assets.router)
 app.include_router(maintenance.router)
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:
+    return Response(render_metrics(), media_type="text/plain; version=0.0.4")

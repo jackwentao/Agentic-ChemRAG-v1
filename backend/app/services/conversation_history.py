@@ -25,6 +25,12 @@ class ConversationHistoryService:
     def get_session(self, session_id: str) -> ConversationSession | None:
         return self.repository.get_session(session_id, self.owner_id)
 
+    def set_session_pinned(self, session_id: str, pinned: bool) -> ConversationSession | None:
+        return self.repository.set_session_pinned(session_id, self.owner_id, pinned)
+
+    def delete_session(self, session_id: str) -> bool:
+        return self.repository.delete_session(session_id, self.owner_id)
+
     def list_messages(self, session_id: str, limit: int = 100) -> list[ConversationMessage]:
         return self.repository.list_messages(session_id, self.owner_id, limit=limit)
 

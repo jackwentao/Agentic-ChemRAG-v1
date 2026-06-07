@@ -17,6 +17,9 @@ class ObjectStorage(ABC):
     def put_bytes(self, key: str, data: bytes, content_type: str) -> None:
         raise NotImplementedError
 
+    def put_file(self, key: str, path: Path, content_type: str) -> None:
+        self.put_bytes(key, path.read_bytes(), content_type)
+
     @abstractmethod
     def open(self, key: str) -> BinaryIO:
         raise NotImplementedError
@@ -35,6 +38,13 @@ class LocalObjectStorage(ObjectStorage):
         path = self._path_for(key)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+
+    def put_file(self, key: str, path: Path, content_type: str) -> None:
+        target = self._path_for(key)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("rb") as source, target.open("wb") as destination:
+            while chunk := source.read(1024 * 1024):
+                destination.write(chunk)
 
     def healthcheck(self) -> None:
         self.root_dir.mkdir(parents=True, exist_ok=True)
@@ -87,6 +97,17 @@ class MinioObjectStorage(ObjectStorage):
             length=len(data),
             content_type=content_type,
         )
+
+    def put_file(self, key: str, path: Path, content_type: str) -> None:
+        size = path.stat().st_size
+        with path.open("rb") as data:
+            self.client.put_object(
+                self.bucket,
+                key,
+                data,
+                length=size,
+                content_type=content_type,
+            )
 
     def open(self, key: str) -> BinaryIO:
         response = self.client.get_object(self.bucket, key)

@@ -36,6 +36,22 @@ def test_parse_golden_case_accepts_required_schema():
     assert case.task_category == "figure_or_summary"
     assert case.expected_retrieval_behavior == "retry_if_missing"
     assert case.max_acceptable_rounds == 2
+    assert case.reference_answer is None
+    assert case.reference_contexts == []
+    assert case.ragas_tags == []
+
+
+def test_parse_golden_case_accepts_optional_ragas_reference_fields():
+    payload = valid_payload()
+    payload["reference_answer"] = "The answer should mention PL."
+    payload["reference_contexts"] = ["Fig. 1 PL spectrum."]
+    payload["ragas_tags"] = ["figure", "chemistry"]
+
+    case = parse_golden_case(payload)
+
+    assert case.reference_answer == "The answer should mention PL."
+    assert case.reference_contexts == ["Fig. 1 PL spectrum."]
+    assert case.ragas_tags == ["figure", "chemistry"]
 
 
 def test_parse_golden_case_requires_expected_route_and_target_type_enums():

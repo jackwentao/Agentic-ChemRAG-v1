@@ -1,4 +1,4 @@
-from backend.app.domain.documents import StoredImage
+from backend.app.domain.documents import DocumentProfile, DocumentProfileField, StoredImage
 from backend.app.database import prepare_database
 from backend.app.repositories.postgres import PgVectorRepository
 
@@ -38,6 +38,8 @@ class FakeConnection:
             return FakeResult(self.engine.figure_rows)
         if "FROM document_profiles" in sql and "ORDER BY embedding" in sql:
             return FakeResult(self.engine.profile_rows)
+        if "FROM document_profile_embeddings" in sql and "ORDER BY embedding" in sql:
+            return FakeResult(self.engine.profile_field_rows)
         return FakeResult()
 
 
@@ -47,6 +49,7 @@ class FakeEngine:
         self.search_rows = []
         self.figure_rows = []
         self.profile_rows = []
+        self.profile_field_rows = []
 
     def begin(self):
         return FakeConnection(self)
@@ -62,6 +65,16 @@ def test_prepare_database_adds_image_metadata_columns():
     assert "ALTER TABLE images ADD COLUMN IF NOT EXISTS nearby_text TEXT" in statements
     assert "CREATE TABLE IF NOT EXISTS figures" in statements
     assert "CREATE TABLE IF NOT EXISTS document_profiles" in statements
+    assert "CREATE TABLE IF NOT EXISTS document_profile_embeddings" in statements
+    assert "ALTER TABLE chunks ADD COLUMN IF NOT EXISTS owner_id TEXT" in statements
+    assert "ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS owner_id TEXT" in statements
+    assert "ALTER TABLE document_profile_embeddings ADD COLUMN IF NOT EXISTS owner_id TEXT" in statements
+    assert "CREATE INDEX IF NOT EXISTS chunks_owner_document_idx" in statements
+    assert "CREATE INDEX IF NOT EXISTS chunks_text_simple_tsv_idx" in statements
+    assert "CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw_idx" in statements
+    assert "CREATE INDEX IF NOT EXISTS figures_embedding_idx" in statements
+    assert "CREATE INDEX IF NOT EXISTS document_profiles_embedding_idx" not in statements
+    assert "DROP INDEX IF EXISTS document_profiles_embedding_idx" in statements
 
 
 def test_pgvector_repository_add_images_persists_caption_metadata():
@@ -127,6 +140,78 @@ def test_pgvector_repository_search_returns_image_caption_metadata():
     assert evidence[0].images[0].label == "Figure 1"
 
 
+def test_pgvector_repository_chunk_search_filters_by_owner_and_can_use_exact_timeout():
+    engine = FakeEngine()
+    engine.search_rows = [
+        {
+            "chunk_id": "c1",
+            "document_id": "doc1",
+            "text": "Photoluminescence increases after doping.",
+            "page_start": 2,
+            "page_end": 2,
+            "section_title": "Results",
+            "score": 0.91,
+            "image_ids": [],
+            "images": [],
+        }
+    ]
+    repository = PgVectorRepository(engine)
+
+    evidence = repository.search(
+        [0.1, 0.2],
+        top_k=1,
+        document_ids=["doc1"],
+        owner_id="tenant-a",
+        search_strategy="exact_then_hnsw",
+        exact_timeout_ms=250,
+    )
+
+    statements = "\n".join(sql for sql, _params in engine.calls)
+    search_params = engine.calls[-1][1]
+    assert evidence[0].chunk_id == "c1"
+    assert "SET LOCAL statement_timeout" in statements
+    assert "SET LOCAL enable_indexscan = off" in statements
+    assert "owner_id = :owner_id" in statements
+    assert search_params["owner_id"] == "tenant-a"
+    assert search_params["document_ids"] == ["doc1"]
+
+
+def test_pgvector_repository_lexical_chunk_search_filters_and_returns_evidence_type():
+    engine = FakeEngine()
+    engine.search_rows = [
+        {
+            "chunk_id": "c-ref",
+            "document_id": "doc1",
+            "text": "C. Ton-That is reference [21].",
+            "page_start": 6,
+            "page_end": 6,
+            "section_title": "References",
+            "score": 1.4,
+            "image_ids": [],
+            "images": [],
+        }
+    ]
+    repository = PgVectorRepository(engine)
+
+    evidence = repository.search_lexical_chunks(
+        "referense numbir for C. Ton-That",
+        top_k=3,
+        document_ids=["doc1"],
+        owner_id="tenant-a",
+    )
+
+    sql, params = engine.calls[-1]
+    assert evidence[0].chunk_id == "c-ref"
+    assert evidence[0].evidence_type == "lexical_chunk"
+    assert evidence[0].metadata["retrieval_source"] == "lexical_chunk"
+    assert "to_tsvector('simple', text)" in sql
+    assert "owner_id = :owner_id" in sql
+    assert params["owner_id"] == "tenant-a"
+    assert params["document_ids"] == ["doc1"]
+    assert "reference" in params["ts_query"]
+    assert "number" in params["ts_query"]
+
+
 def test_pgvector_repository_add_figures_and_search_returns_figure_evidence():
     engine = FakeEngine()
     engine.figure_rows = [
@@ -164,3 +249,132 @@ def test_pgvector_repository_add_figures_and_search_returns_figure_evidence():
     assert engine.calls[0][1]["figure_id"] == "img1"
     assert evidence[0].chunk_id == "figure:img1"
     assert evidence[0].images[0].label == "Figure 2"
+
+
+def test_pgvector_repository_vector_searches_do_not_disable_index_scans():
+    engine = FakeEngine()
+    engine.figure_rows = [
+        {
+            "figure_id": "fig1",
+            "image_id": "img1",
+            "document_id": "doc1",
+            "page": 1,
+            "label": "Figure 1",
+            "caption": "Band gap trend.",
+            "nearby_text": None,
+            "width": 320,
+            "height": 240,
+            "score": 0.91,
+        }
+    ]
+    engine.profile_rows = [
+        {
+            "document_id": "doc1",
+            "title": "Photocatalyst profile",
+            "abstract": None,
+            "conclusion": None,
+            "summary_text": "Summary for photocatalyst document.",
+            "topics": [],
+            "entities": [],
+            "profile_json": {},
+            "outline_json": [],
+            "source_refs_json": [],
+            "figure_summary": None,
+            "score": 0.87,
+        }
+    ]
+    repository = PgVectorRepository(engine)
+
+    figure_evidence = repository.search_figures([0.1, 0.2], top_k=1)
+    profile_evidence = repository.search_document_profiles([0.1, 0.2], top_k=1)
+
+    statements = "\n".join(sql for sql, _params in engine.calls)
+    assert "SET LOCAL enable_indexscan = off" not in statements
+    assert "SET LOCAL enable_bitmapscan = off" not in statements
+    assert figure_evidence[0].chunk_id == "figure:fig1"
+    assert profile_evidence[0].chunk_id == "profile:doc1"
+
+
+def test_pgvector_repository_upserts_and_searches_document_profile():
+    engine = FakeEngine()
+    engine.profile_rows = [
+        {
+            "document_id": "doc1",
+            "title": "Photocatalyst profile",
+            "abstract": "Abstract text.",
+            "conclusion": "Conclusion text.",
+            "summary_text": "Document level summary.",
+            "topics": ["photocatalysis"],
+            "entities": ["TiO2"],
+            "profile_json": {"conclusion": "Conclusion text."},
+            "outline_json": [],
+            "source_refs_json": [],
+            "figure_summary": "Figure summary.",
+            "score": 0.82,
+        }
+    ]
+    repository = PgVectorRepository(engine)
+
+    repository.upsert_document_profile(
+        DocumentProfile(
+            document_id="doc1",
+            title="Photocatalyst profile",
+            abstract="Abstract text.",
+            conclusion="Conclusion text.",
+            summary_text="Document level summary.",
+            topics=["photocatalysis"],
+            entities=["TiO2"],
+            figure_summary="Figure summary.",
+        ),
+        [0.1, 0.2],
+    )
+    evidence = repository.search_document_profiles([0.1, 0.2], top_k=1)
+
+    assert engine.calls[0][1]["document_id"] == "doc1"
+    assert engine.calls[0][1]["conclusion"] == "Conclusion text."
+    assert engine.calls[0][1]["topics"] == '["photocatalysis"]'
+    assert engine.calls[0][1]["entities"] == '["TiO2"]'
+    assert "outline_json" in engine.calls[0][1]
+    assert evidence[0].chunk_id == "profile:doc1"
+    assert evidence[0].section_title == "Photocatalyst profile"
+    assert evidence[0].evidence_type == "document_profile"
+    assert evidence[0].source_scope == "document_level"
+    assert evidence[0].metadata["conclusion"] == "Conclusion text."
+
+
+def test_pgvector_repository_upserts_and_searches_document_profile_fields():
+    engine = FakeEngine()
+    engine.profile_field_rows = [
+        {
+            "profile_field_id": "doc1:properties",
+            "document_id": "doc1",
+            "field_name": "properties",
+            "field_text": "photoluminescence emission intensity",
+            "source_refs_json": [],
+            "metadata_json": {"profile_title": "Photocatalyst profile"},
+            "score": 0.91,
+        }
+    ]
+    repository = PgVectorRepository(engine)
+
+    repository.upsert_document_profile_fields(
+        "doc1",
+        [
+            DocumentProfileField(
+                document_id="doc1",
+                field_name="properties",
+                text="photoluminescence emission intensity",
+                metadata={"profile_title": "Photocatalyst profile"},
+            )
+        ],
+        [[0.1, 0.2]],
+    )
+    evidence = repository.search_document_profiles([0.1, 0.2], top_k=1)
+
+    statements = "\n".join(sql for sql, _params in engine.calls)
+    assert "DELETE FROM document_profile_embeddings" in statements
+    assert "INSERT INTO document_profile_embeddings" in statements
+    assert evidence[0].chunk_id == "profile:doc1:properties"
+    assert evidence[0].evidence_type == "document_profile"
+    assert evidence[0].source_scope == "document_level"
+    assert evidence[0].metadata["profile_field"] == "properties"

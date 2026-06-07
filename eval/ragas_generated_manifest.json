@@ -1,0 +1,14 @@
+{
+  "pdfs": [
+    {
+      "path": "test_pdf\\Band alignment and charge transport characteristics of TPP_ZnO hybrid for photovoltaic cell potential(科研通-ablesci.com).pdf",
+      "sha256": "1f2f9ad59ad93bd7393936948fcdafe153c1056ee15ca9dab5266b68ef72609e"
+    }
+  ],
+  "page_count": 6,
+  "generated_row_count": 3,
+  "output": "eval\\ragas_generated_cases.jsonl",
+  "scope": "all_documents",
+  "testset_size": 2,
+  "document_id_mode": "db_or_hash"
+}

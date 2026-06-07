@@ -49,6 +49,10 @@ class IngestionService:
             profile = self.profile_builder.build(parsed)
             profile_embedding = self.embedding_provider.embed_query(profile.summary_text)
             self.repository.upsert_document_profile(profile, profile_embedding)
+            profile_fields = self.profile_builder.field_texts(profile)
+            if profile_fields and hasattr(self.repository, "upsert_document_profile_fields"):
+                field_embeddings = self.embedding_provider.embed_documents([field.text for field in profile_fields])
+                self.repository.upsert_document_profile_fields(profile.document_id, profile_fields, field_embeddings)
         indexable_chunks = [chunk for chunk in chunks if chunk.chunk_type == "child"]
         embeddings = self.embedding_provider.embed_documents([chunk.text for chunk in indexable_chunks])
         self.repository.add_chunks(indexable_chunks, embeddings)

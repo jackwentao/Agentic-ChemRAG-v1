@@ -1,9 +1,12 @@
 import json
+from dataclasses import asdict
+import re
 
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from backend.app.domain.documents import Chunk, DocumentProfile, Evidence, EvidenceImage, StoredImage
+from backend.app.domain.documents import Chunk, DocumentProfile, DocumentProfileField, Evidence, EvidenceImage, SourceRef, StoredImage
 
 
 class PgVectorRepository:
@@ -21,21 +24,25 @@ class PgVectorRepository:
                     text(
                         """
                         INSERT INTO chunks (
-                            chunk_id, document_id, parent_id, text, page_start, page_end,
+                            chunk_id, document_id, owner_id, parent_id, text, page_start, page_end,
                             section_title, section_path, chunk_type, embedding
                         )
                         VALUES (
-                            :chunk_id, :document_id, :parent_id, :text, :page_start, :page_end,
+                            :chunk_id, :document_id,
+                            COALESCE(:owner_id, (SELECT owner_id FROM documents WHERE document_id = :document_id), 'demo'),
+                            :parent_id, :text, :page_start, :page_end,
                             :section_title, :section_path, :chunk_type, :embedding
                         )
                         ON CONFLICT (chunk_id) DO UPDATE SET
                             text = EXCLUDED.text,
+                            owner_id = EXCLUDED.owner_id,
                             embedding = EXCLUDED.embedding
                         """
                     ),
                     {
                         "chunk_id": chunk.chunk_id,
                         "document_id": chunk.document_id,
+                        "owner_id": chunk.owner_id,
                         "parent_id": chunk.parent_id,
                         "text": chunk.text,
                         "page_start": chunk.page_start,
@@ -217,6 +224,27 @@ class PgVectorRepository:
             ).mappings().first()
         return dict(row) if row else None
 
+    def get_document_for_ingestion(self, document_id: str) -> dict[str, object] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT document_id,
+                           owner_id,
+                           COALESCE(original_filename, filename) AS filename,
+                           file_hash,
+                           file_size,
+                           pdf_object_key,
+                           indexing_status
+                    FROM documents
+                    WHERE document_id = :document_id
+                    LIMIT 1
+                    """
+                ),
+                {"document_id": document_id},
+            ).mappings().first()
+        return dict(row) if row else None
+
     def get_image_asset(self, image_id: str) -> dict[str, object] | None:
         with self.engine.begin() as conn:
             row = conn.execute(
@@ -372,8 +400,143 @@ class PgVectorRepository:
             ).scalars().all()
         return [str(row) for row in rows]
 
-    def search(self, query_embedding: list[float], top_k: int = 5, document_ids: list[str] | None = None) -> list[Evidence]:
-        filters = "AND document_id = ANY(:document_ids)" if document_ids else ""
+    def count_searchable_chunks(
+        self,
+        document_ids: list[str] | None = None,
+        owner_id: str | None = None,
+    ) -> int:
+        filters, params = _ownership_filters(document_ids=document_ids, owner_id=owner_id)
+        where = " AND ".join(["chunk_type = 'child'", *filters])
+        with self.engine.begin() as conn:
+            count = conn.execute(
+                text(f"SELECT COUNT(*) FROM chunks WHERE {where}"),
+                params,
+            ).scalar_one()
+        return int(count)
+
+    def search(
+        self,
+        query_embedding: list[float],
+        top_k: int = 5,
+        document_ids: list[str] | None = None,
+        owner_id: str | None = None,
+        search_strategy: str = "hnsw",
+        exact_timeout_ms: int | None = None,
+    ) -> list[Evidence]:
+        if search_strategy == "exact_then_hnsw":
+            try:
+                return self._search_chunks(
+                    query_embedding,
+                    top_k=top_k,
+                    document_ids=document_ids,
+                    owner_id=owner_id,
+                    search_strategy="exact",
+                    exact_timeout_ms=exact_timeout_ms,
+                )
+            except DBAPIError:
+                return self._search_chunks(
+                    query_embedding,
+                    top_k=top_k,
+                    document_ids=document_ids,
+                    owner_id=owner_id,
+                    search_strategy="hnsw",
+                    exact_timeout_ms=None,
+                )
+        return self._search_chunks(
+            query_embedding,
+            top_k=top_k,
+            document_ids=document_ids,
+            owner_id=owner_id,
+            search_strategy=search_strategy,
+            exact_timeout_ms=exact_timeout_ms,
+        )
+
+    def search_lexical_chunks(
+        self,
+        query: str,
+        top_k: int = 5,
+        document_ids: list[str] | None = None,
+        owner_id: str | None = None,
+    ) -> list[Evidence]:
+        terms = _lexical_terms(query)
+        if not terms:
+            return []
+        filter_parts, params = _ownership_filters(document_ids=document_ids, owner_id=owner_id)
+        term_filters = []
+        term_score_parts = []
+        for index, term in enumerate(terms[:8]):
+            key = f"term_{index}"
+            params[key] = f"%{term}%"
+            term_filters.append(f"text ILIKE :{key}")
+            term_score_parts.append(f"CASE WHEN text ILIKE :{key} THEN {_lexical_term_weight(term):.2f} ELSE 0 END")
+        ts_query = " ".join(terms[:12])
+        params["ts_query"] = ts_query
+        params["phrase"] = f"%{' '.join(terms[:4])}%"
+        params["top_k"] = top_k
+        where = " AND ".join(["chunk_type = 'child'", *filter_parts])
+        lexical_filter = " OR ".join(["to_tsvector('simple', text) @@ plainto_tsquery('simple', :ts_query)", *term_filters])
+        term_score = " + ".join(term_score_parts) if term_score_parts else "0"
+        sql = text(
+            f"""
+            WITH ranked AS (
+                SELECT chunk_id, document_id, text, page_start, page_end, section_title,
+                       (
+                           ts_rank_cd(to_tsvector('simple', text), plainto_tsquery('simple', :ts_query))
+                           + CASE WHEN text ILIKE :phrase THEN 1.00 ELSE 0 END
+                           + {term_score}
+                       ) AS score
+                FROM chunks
+                WHERE {where}
+                  AND ({lexical_filter})
+                ORDER BY score DESC, page_start ASC, chunk_id ASC
+                LIMIT :top_k
+            )
+            SELECT ranked.*,
+                   COALESCE(image_candidates.image_ids, ARRAY[]::text[]) AS image_ids,
+                   COALESCE(image_candidates.images, '[]'::jsonb) AS images
+            FROM ranked
+            LEFT JOIN LATERAL (
+                SELECT array_agg(limited.image_id ORDER BY limited.page, limited.image_id) AS image_ids,
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'image_id', limited.image_id,
+                               'page', limited.page,
+                               'width', limited.width,
+                               'height', limited.height,
+                               'label', limited.label,
+                               'caption', limited.caption,
+                               'nearby_text', limited.nearby_text
+                           )
+                           ORDER BY limited.page, limited.image_id
+                       ) AS images
+                FROM (
+                    SELECT image_id, page, width, height, label, caption, nearby_text
+                    FROM images
+                    WHERE images.document_id = ranked.document_id
+                      AND images.page BETWEEN ranked.page_start AND ranked.page_end
+                    ORDER BY images.page, images.image_id
+                    LIMIT 5
+                ) AS limited
+            ) AS image_candidates ON TRUE
+            ORDER BY ranked.score DESC, ranked.page_start ASC, ranked.chunk_id ASC
+            LIMIT :top_k
+            """
+        )
+        with self.engine.begin() as conn:
+            rows = conn.execute(sql, params).mappings().all()
+        return _chunk_rows_to_evidence(rows, evidence_type="lexical_chunk")
+
+    def _search_chunks(
+        self,
+        query_embedding: list[float],
+        top_k: int,
+        document_ids: list[str] | None,
+        owner_id: str | None,
+        search_strategy: str,
+        exact_timeout_ms: int | None,
+    ) -> list[Evidence]:
+        filter_parts, params = _ownership_filters(document_ids=document_ids, owner_id=owner_id)
+        filters = f"AND {' AND '.join(filter_parts)}" if filter_parts else ""
         sql = text(
             f"""
             WITH ranked AS (
@@ -415,26 +578,35 @@ class PgVectorRepository:
             LIMIT :top_k
             """
         )
-        params = {"query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
-        if document_ids:
-            params["document_ids"] = document_ids
+        params = {**params, "query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
         with self.engine.begin() as conn:
+            if search_strategy == "exact":
+                if exact_timeout_ms:
+                    conn.execute(text("SET LOCAL statement_timeout = :timeout"), {"timeout": f"{int(exact_timeout_ms)}ms"})
+                conn.execute(text("SET LOCAL enable_indexscan = off"))
+                conn.execute(text("SET LOCAL enable_bitmapscan = off"))
+                conn.execute(text("SET LOCAL enable_indexonlyscan = off"))
+            elif search_strategy == "hnsw":
+                conn.execute(text("SET LOCAL enable_seqscan = off"))
             rows = conn.execute(sql, params).mappings().all()
-        evidence = []
-        for row in rows:
-            data = dict(row)
-            images = data.pop("images") or []
-            data["images"] = [EvidenceImage(**dict(image)) for image in images]
-            evidence.append(Evidence(**data))
-        return evidence
+        return _chunk_rows_to_evidence(rows)
 
     def search_figures(
         self,
         query_embedding: list[float],
         top_k: int = 8,
         document_ids: list[str] | None = None,
+        owner_id: str | None = None,
     ) -> list[Evidence]:
-        filters = "AND document_id = ANY(:document_ids)" if document_ids else ""
+        filter_parts = []
+        params: dict[str, object] = {}
+        if document_ids:
+            filter_parts.append("document_id = ANY(:document_ids)")
+            params["document_ids"] = document_ids
+        if owner_id:
+            filter_parts.append("document_id IN (SELECT document_id FROM documents WHERE owner_id = :owner_id)")
+            params["owner_id"] = owner_id
+        filters = f"AND {' AND '.join(filter_parts)}" if filter_parts else ""
         sql = text(
             f"""
             SELECT figure_id, image_id, document_id, page, label, caption, nearby_text,
@@ -446,12 +618,8 @@ class PgVectorRepository:
             LIMIT :top_k
             """
         )
-        params = {"query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
-        if document_ids:
-            params["document_ids"] = document_ids
+        params = {**params, "query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
         with self.engine.begin() as conn:
-            conn.execute(text("SET LOCAL enable_indexscan = off"))
-            conn.execute(text("SET LOCAL enable_bitmapscan = off"))
             rows = conn.execute(sql, params).mappings().all()
 
         evidence: list[Evidence] = []
@@ -481,6 +649,18 @@ class PgVectorRepository:
                     score=float(figure["score"] or 0),
                     image_ids=[image.image_id],
                     images=[image],
+                    evidence_type="figure",
+                    source_scope="page_span",
+                    source_refs=[
+                        SourceRef(
+                            source_type="figure_caption",
+                            page_start=page,
+                            page_end=page,
+                            section_title="Figure Index",
+                            field_name="caption",
+                            text=text_value[:500],
+                        )
+                    ],
                 )
             )
         return evidence
@@ -491,20 +671,29 @@ class PgVectorRepository:
                 text(
                     """
                     INSERT INTO document_profiles (
-                        document_id, title, abstract, summary_text, topics, entities,
-                        figure_summary, embedding, updated_at
+                        document_id, owner_id, title, abstract, conclusion, summary_text, topics, entities,
+                        profile_json, outline_json, source_refs_json, figure_summary, embedding, updated_at
                     )
                     VALUES (
-                        :document_id, :title, :abstract, :summary_text,
+                        :document_id,
+                        COALESCE(:owner_id, (SELECT owner_id FROM documents WHERE document_id = :document_id), 'demo'),
+                        :title, :abstract, :conclusion, :summary_text,
                         CAST(:topics AS jsonb), CAST(:entities AS jsonb),
+                        CAST(:profile_json AS jsonb), CAST(:outline_json AS jsonb),
+                        CAST(:source_refs_json AS jsonb),
                         :figure_summary, :embedding, now()
                     )
                     ON CONFLICT (document_id) DO UPDATE SET
+                        owner_id = EXCLUDED.owner_id,
                         title = EXCLUDED.title,
                         abstract = EXCLUDED.abstract,
+                        conclusion = EXCLUDED.conclusion,
                         summary_text = EXCLUDED.summary_text,
                         topics = EXCLUDED.topics,
                         entities = EXCLUDED.entities,
+                        profile_json = EXCLUDED.profile_json,
+                        outline_json = EXCLUDED.outline_json,
+                        source_refs_json = EXCLUDED.source_refs_json,
                         figure_summary = EXCLUDED.figure_summary,
                         embedding = EXCLUDED.embedding,
                         updated_at = now()
@@ -512,26 +701,89 @@ class PgVectorRepository:
                 ),
                 {
                     "document_id": profile.document_id,
+                    "owner_id": profile.owner_id,
                     "title": profile.title,
                     "abstract": profile.abstract,
+                    "conclusion": profile.conclusion,
                     "summary_text": profile.summary_text,
                     "topics": json.dumps(profile.topics, ensure_ascii=False),
                     "entities": json.dumps(profile.entities, ensure_ascii=False),
+                    "profile_json": json.dumps(_profile_payload(profile), ensure_ascii=False),
+                    "outline_json": json.dumps([asdict(section) for section in profile.outline], ensure_ascii=False),
+                    "source_refs_json": json.dumps([asdict(ref) for ref in profile.source_refs], ensure_ascii=False),
                     "figure_summary": profile.figure_summary,
                     "embedding": self._vector_literal(embedding),
                 },
             )
+
+    def upsert_document_profile_fields(
+        self,
+        document_id: str,
+        fields: list[DocumentProfileField],
+        embeddings: list[list[float]],
+    ) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM document_profile_embeddings WHERE document_id = :document_id"),
+                {"document_id": document_id},
+            )
+            for field, embedding in zip(fields, embeddings, strict=True):
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO document_profile_embeddings (
+                            profile_field_id, document_id, owner_id, field_name, field_text,
+                            source_refs_json, metadata_json, embedding, updated_at
+                        )
+                        VALUES (
+                            :profile_field_id, :document_id,
+                            COALESCE(:owner_id, (SELECT owner_id FROM documents WHERE document_id = :document_id), 'demo'),
+                            :field_name, :field_text,
+                            CAST(:source_refs_json AS jsonb), CAST(:metadata_json AS jsonb),
+                            :embedding, now()
+                        )
+                        ON CONFLICT (profile_field_id) DO UPDATE SET
+                            owner_id = EXCLUDED.owner_id,
+                            field_text = EXCLUDED.field_text,
+                            source_refs_json = EXCLUDED.source_refs_json,
+                            metadata_json = EXCLUDED.metadata_json,
+                            embedding = EXCLUDED.embedding,
+                            updated_at = now()
+                        """
+                    ),
+                    {
+                        "profile_field_id": _profile_field_id(field.document_id, field.field_name),
+                        "document_id": field.document_id,
+                        "owner_id": field.owner_id,
+                        "field_name": field.field_name,
+                        "field_text": field.text,
+                        "source_refs_json": json.dumps([asdict(ref) for ref in field.source_refs], ensure_ascii=False),
+                        "metadata_json": json.dumps(field.metadata, ensure_ascii=False),
+                        "embedding": self._vector_literal(embedding),
+                    },
+                )
 
     def search_document_profiles(
         self,
         query_embedding: list[float],
         top_k: int = 5,
         document_ids: list[str] | None = None,
+        owner_id: str | None = None,
     ) -> list[Evidence]:
-        filters = "AND document_id = ANY(:document_ids)" if document_ids else ""
+        field_evidence = self.search_document_profile_fields(
+            query_embedding,
+            top_k=top_k,
+            document_ids=document_ids,
+            owner_id=owner_id,
+        )
+        if field_evidence:
+            return field_evidence
+        filter_parts, params = _ownership_filters(document_ids=document_ids, owner_id=owner_id)
+        filters = f"AND {' AND '.join(filter_parts)}" if filter_parts else ""
         sql = text(
             f"""
-            SELECT document_id, title, abstract, summary_text, topics, entities, figure_summary,
+            SELECT document_id, title, abstract, conclusion, summary_text, topics, entities,
+                   profile_json, outline_json, source_refs_json, figure_summary,
                    1 - (embedding <=> :query_embedding) AS score
             FROM document_profiles
             WHERE embedding IS NOT NULL {filters}
@@ -539,12 +791,8 @@ class PgVectorRepository:
             LIMIT :top_k
             """
         )
-        params = {"query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
-        if document_ids:
-            params["document_ids"] = document_ids
+        params = {**params, "query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
         with self.engine.begin() as conn:
-            conn.execute(text("SET LOCAL enable_indexscan = off"))
-            conn.execute(text("SET LOCAL enable_bitmapscan = off"))
             rows = conn.execute(sql, params).mappings().all()
 
         evidence: list[Evidence] = []
@@ -552,6 +800,7 @@ class PgVectorRepository:
             profile = dict(row)
             text_value = str(profile.get("summary_text") or "")
             title = str(profile.get("title") or "Document Profile")
+            source_refs = _source_refs_from_profile_row(profile)
             evidence.append(
                 Evidence(
                     chunk_id=f"profile:{profile['document_id']}",
@@ -563,9 +812,268 @@ class PgVectorRepository:
                     score=float(profile["score"] or 0),
                     image_ids=[],
                     images=[],
+                    evidence_type="document_profile",
+                    source_scope="document_level",
+                    source_refs=source_refs,
+                    metadata={
+                        "title": profile.get("title"),
+                        "abstract": profile.get("abstract"),
+                        "conclusion": profile.get("conclusion"),
+                        "topics": _json_value(profile.get("topics"), []),
+                        "entities": _json_value(profile.get("entities"), []),
+                        "figure_summary": profile.get("figure_summary"),
+                        "outline": _json_value(profile.get("outline_json"), []),
+                        "profile": _json_value(profile.get("profile_json"), {}),
+                        **_metadata_from_profile_json(profile.get("profile_json")),
+                    },
+                )
+            )
+        return evidence
+
+    def search_document_profile_fields(
+        self,
+        query_embedding: list[float],
+        top_k: int = 5,
+        document_ids: list[str] | None = None,
+        field_names: list[str] | None = None,
+        owner_id: str | None = None,
+    ) -> list[Evidence]:
+        filters, params = _ownership_filters(document_ids=document_ids, owner_id=owner_id)
+        params = {**params, "query_embedding": self._vector_literal(query_embedding), "top_k": top_k}
+        if field_names:
+            filters.append("field_name = ANY(:field_names)")
+            params["field_names"] = field_names
+        where = " AND ".join(["embedding IS NOT NULL", *filters])
+        sql = text(
+            f"""
+            SELECT profile_field_id, document_id, field_name, field_text,
+                   source_refs_json, metadata_json,
+                   1 - (embedding <=> :query_embedding) AS score
+            FROM document_profile_embeddings
+            WHERE {where}
+            ORDER BY embedding <=> :query_embedding
+            LIMIT :top_k
+            """
+        )
+        with self.engine.begin() as conn:
+            rows = conn.execute(sql, params).mappings().all()
+
+        evidence: list[Evidence] = []
+        for row in rows:
+            field = dict(row)
+            field_name = str(field.get("field_name") or "profile_field")
+            metadata = _json_value(field.get("metadata_json"), {})
+            evidence.append(
+                Evidence(
+                    chunk_id=f"profile:{field['document_id']}:{field_name}",
+                    document_id=str(field["document_id"]),
+                    text=str(field.get("field_text") or ""),
+                    page_start=1,
+                    page_end=1,
+                    section_title=f"Document Profile / {field_name}",
+                    score=float(field["score"] or 0),
+                    evidence_type="document_profile",
+                    source_scope="document_level",
+                    source_refs=_source_refs_from_json(field.get("source_refs_json"), fallback_text=str(field.get("field_text") or "")),
+                    metadata={
+                        **(metadata if isinstance(metadata, dict) else {}),
+                        "profile_field": field_name,
+                    },
                 )
             )
         return evidence
 
     def _vector_literal(self, vector: list[float]) -> str:
         return "[" + ",".join(f"{value:.8f}" for value in vector) + "]"
+
+
+def _ownership_filters(
+    *,
+    document_ids: list[str] | None,
+    owner_id: str | None,
+) -> tuple[list[str], dict[str, object]]:
+    filters: list[str] = []
+    params: dict[str, object] = {}
+    if document_ids:
+        filters.append("document_id = ANY(:document_ids)")
+        params["document_ids"] = document_ids
+    if owner_id:
+        filters.append("owner_id = :owner_id")
+        params["owner_id"] = owner_id
+    return filters, params
+
+
+def _chunk_rows_to_evidence(rows, evidence_type: str = "chunk") -> list[Evidence]:
+    evidence = []
+    for row in rows:
+        data = dict(row)
+        images = data.pop("images") or []
+        data["images"] = [EvidenceImage(**dict(image)) for image in images]
+        data["evidence_type"] = evidence_type
+        data["metadata"] = {
+            **(data.get("metadata") if isinstance(data.get("metadata"), dict) else {}),
+            "retrieval_source": evidence_type,
+        }
+        evidence.append(Evidence(**data))
+    return evidence
+
+
+def _lexical_terms(query: str) -> list[str]:
+    aliases = {
+        "referense": "reference",
+        "numbir": "number",
+        "materiel": "material",
+        "resonans": "resonance",
+        "spektra": "spectra",
+        "potenshal": "potential",
+        "soler": "solar",
+        "energjy": "energy",
+        "renewabel": "renewable",
+        "discribed": "described",
+    }
+    normalized = query.lower()
+    for typo, correction in aliases.items():
+        normalized = normalized.replace(typo, correction)
+    raw_terms = re.findall(r"[a-z][a-z0-9.-]{1,}|[\u4e00-\u9fff]{2,}", normalized)
+    stopwords = {
+        "what",
+        "which",
+        "where",
+        "when",
+        "how",
+        "does",
+        "with",
+        "from",
+        "into",
+        "that",
+        "this",
+        "paper",
+        "article",
+        "shown",
+        "list",
+        "work",
+        "material",
+        "system",
+        "studied",
+        "study",
+    }
+    terms: list[str] = []
+    for raw in raw_terms:
+        term = raw.strip(".-")
+        if len(term) < 2 or term in stopwords:
+            continue
+        if "." in term:
+            parts = [part for part in term.split(".") if len(part) >= 2]
+            if parts:
+                for part in parts:
+                    if part not in stopwords and part not in terms:
+                        terms.append(part)
+                continue
+        if term not in terms:
+            terms.append(term)
+    return terms
+
+
+def _lexical_term_weight(term: str) -> float:
+    if "-" in term or "/" in term:
+        return 1.40
+    if re.search(r"[a-z]+\d|\d+[a-z]+", term):
+        return 0.85
+    if len(term) >= 7 and term not in {"spectra", "reference"}:
+        return 0.55
+    if term in {"reference", "number", "author", "affiliation", "department"}:
+        return 0.35
+    return 0.20
+
+
+def _profile_payload(profile: DocumentProfile) -> dict[str, object]:
+    return {
+        "document_id": profile.document_id,
+        "owner_id": profile.owner_id,
+        "title": profile.title,
+        "authors": profile.authors,
+        "affiliations": profile.affiliations,
+        "corresponding_author": profile.corresponding_author,
+        "journal": profile.journal,
+        "publication_year": profile.publication_year,
+        "doi": profile.doi,
+        "keywords": profile.keywords,
+        "abstract": profile.abstract,
+        "conclusion": profile.conclusion,
+        "topics": profile.topics,
+        "entities": profile.entities,
+        "typed_entities": [asdict(entity) for entity in profile.typed_entities],
+        "key_findings": profile.key_findings,
+        "methods": profile.methods,
+        "properties": profile.properties,
+        "applications": profile.applications,
+        "limitations": profile.limitations,
+        "extraction_method": profile.extraction_method,
+        "extraction_warnings": profile.extraction_warnings,
+    }
+
+
+def _profile_field_id(document_id: str, field_name: str) -> str:
+    return f"{document_id}:{field_name}"
+
+
+def _metadata_from_profile_json(value) -> dict[str, object]:
+    profile = _json_value(value, {})
+    if not isinstance(profile, dict):
+        return {}
+    keys = ["authors", "affiliations", "corresponding_author", "journal", "publication_year", "doi", "keywords"]
+    return {key: profile.get(key) for key in keys if key in profile}
+
+
+def _source_refs_from_profile_row(profile: dict) -> list[SourceRef]:
+    return _source_refs_from_json(profile.get("source_refs_json"), fallback_text=str(profile.get("summary_text") or ""))
+
+
+def _source_refs_from_json(value, fallback_text: str) -> list[SourceRef]:
+    raw_refs = _json_value(value, [])
+    refs: list[SourceRef] = []
+    if isinstance(raw_refs, list):
+        for raw_ref in raw_refs:
+            if not isinstance(raw_ref, dict):
+                continue
+            refs.append(
+                SourceRef(
+                    source_type=str(raw_ref.get("source_type") or "profile_field"),
+                    page_start=_optional_int(raw_ref.get("page_start")),
+                    page_end=_optional_int(raw_ref.get("page_end")),
+                    section_title=_optional_str(raw_ref.get("section_title")),
+                    field_name=_optional_str(raw_ref.get("field_name")),
+                    text=_optional_str(raw_ref.get("text")),
+                )
+            )
+    if refs:
+        return refs
+    return [
+        SourceRef(
+            source_type="generated_profile",
+            field_name="summary_text",
+            text=fallback_text[:500],
+        )
+    ]
+
+
+def _json_value(value, default):
+    if value is None:
+        return default
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return default
+    return value
+
+
+def _optional_str(value) -> str | None:
+    return None if value is None else str(value)
+
+
+def _optional_int(value) -> int | None:
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None

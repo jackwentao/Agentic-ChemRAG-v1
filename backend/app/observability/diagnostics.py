@@ -155,6 +155,67 @@ def build_verifier_diagnostics(
     }
 
 
+def build_answer_verification_diagnostics(
+    *,
+    latency_ms: float,
+    triggered: bool,
+    passed: bool,
+    trigger_reasons: list[str],
+    unsupported_claims: list[str],
+    missing_disclosures: list[str],
+    citation_errors: list[str],
+    overstatements: list[str],
+    revision_instruction: str | None,
+    used_llm: bool,
+    fallback_used: bool,
+    reason: str,
+    revision_applied: bool = False,
+) -> dict[str, Any]:
+    return {
+        "latency_ms": float(latency_ms),
+        "triggered": bool(triggered),
+        "passed": bool(passed),
+        "trigger_reasons": list(trigger_reasons),
+        "unsupported_claim_count": len(unsupported_claims),
+        "missing_disclosure_count": len(missing_disclosures),
+        "citation_error_count": len(citation_errors),
+        "overstatement_count": len(overstatements),
+        "unsupported_claims": list(unsupported_claims),
+        "missing_disclosures": list(missing_disclosures),
+        "citation_errors": list(citation_errors),
+        "overstatements": list(overstatements),
+        "revision_required": bool(revision_instruction),
+        "revision_applied": bool(revision_applied),
+        "revision_instruction": revision_instruction,
+        "used_llm": bool(used_llm),
+        "fallback_used": bool(fallback_used),
+        "reason": reason,
+        "proxy_hit": bool(triggered and passed),
+    }
+
+
+def build_image_selection_diagnostics(
+    *,
+    strategy: str,
+    used_llm: bool,
+    fallback_used: bool,
+    candidate_count: int,
+    selected_count: int,
+    latency_ms: float,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "strategy": strategy,
+        "used_llm": bool(used_llm),
+        "fallback_used": bool(fallback_used),
+        "candidate_count": int(candidate_count),
+        "selected_count": int(selected_count),
+        "latency_ms": float(latency_ms),
+        "reason": reason,
+        "proxy_hit": selected_count > 0,
+    }
+
+
 def build_retrieval_round_diagnostics(
     *,
     round_index: int,
@@ -221,6 +282,9 @@ def increment_llm_call_count(
     payload = {
         "evidence_assessment": 0,
         "answer_generation": 0,
+        "answer_verification": 0,
+        "answer_revision": 0,
+        "image_selection": 0,
         **{key: int(value) for key, value in (counts or {}).items()},
     }
     if used_llm:

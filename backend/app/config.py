@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     env: str = "dev"
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    database_auto_prepare: bool = True
 
     database_url: str = "postgresql+psycopg://chemrag:chemrag@localhost:5432/chemrag"
     redis_url: str = "redis://localhost:6380/0"
@@ -34,6 +35,7 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-v4-flash"
     deepseek_timeout_seconds: float = 25.0
     llm_image_selection_enabled: bool = False
+    llm_profile_extraction_enabled: bool = True
 
     embedding_provider: str = "local_bge_m3"
     embedding_model: str = "BAAI/bge-m3"
@@ -49,6 +51,8 @@ class Settings(BaseSettings):
     reranker_chunk_candidates: int = Field(default=10, gt=0)
     reranker_figure_candidates: int = Field(default=10, gt=0)
     reranker_min_candidates: int = Field(default=10, gt=0)
+    retrieval_exact_chunk_limit: int = Field(default=2000, ge=0)
+    retrieval_exact_timeout_ms: int = Field(default=300, gt=0)
     reranker_warmup_on_startup: bool = True
     conversation_recent_turns: int = Field(default=3, ge=0)
     conversation_max_context_chars: int = Field(default=8000, gt=0)
@@ -56,6 +60,19 @@ class Settings(BaseSettings):
     conversation_assistant_excerpt_chars: int = Field(default=240, gt=0)
     conversation_citation_limit_per_turn: int = Field(default=3, ge=0)
     conversation_limitation_limit_per_turn: int = Field(default=2, ge=0)
+    upload_max_file_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
+    upload_max_batch_files: int = Field(default=10, gt=0)
+    upload_spool_max_memory_bytes: int = Field(default=8 * 1024 * 1024, gt=0)
+    upload_allowed_mime_types: str = "application/pdf"
+    pdf_max_pages: int = Field(default=300, gt=0)
+    pdf_parse_probe_timeout_seconds: float = Field(default=10.0, gt=0)
+    pdf_max_extracted_images: int = Field(default=500, ge=0)
+    pdf_max_image_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    malware_scanner_provider: str = "noop"
+    request_id_header: str = "X-Request-ID"
+    log_format: str = "plain"
+    metrics_enabled: bool = True
+    app_version: str = "0.1.0"
 
 
 @lru_cache

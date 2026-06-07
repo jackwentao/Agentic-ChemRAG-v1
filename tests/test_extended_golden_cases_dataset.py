@@ -49,3 +49,20 @@ def test_extended_golden_cases_include_realistic_cross_doc_and_high_risk_example
     assert cross_doc.scope == "all_documents"
     assert cross_doc.target_type == "mixed"
     assert cross_doc.expected_route == "figure_index"
+
+
+def test_hybrid_retrieval_regression_cases_capture_ragas_failures():
+    cases = {case.case_id: case for case in load_golden_cases(Path("eval/retrieval_hybrid_regression_cases.jsonl"))}
+
+    author = cases["hybrid-author-affiliation-001"]
+    reference = cases["hybrid-reference-figure-001"]
+
+    assert author.expected_route == "chunk_search"
+    assert author.expected_documents == ["2b62f1044bf242f7b5d8445c2788ef29"]
+    assert author.expected_pages == [1]
+    assert "author_affiliation" in author.ragas_tags
+
+    assert reference.task_category == "multi_condition"
+    assert reference.expected_route == "chunk_search"
+    assert reference.expected_pages == [6]
+    assert "typo_robustness" in reference.ragas_tags

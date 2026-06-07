@@ -1,19 +1,21 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { FileUp, Send } from "lucide-react";
+import { FileUp, Pin, PinOff, Send, Trash2 } from "lucide-react";
 import "./styles.css";
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000";
 
 type Citation = {
   document_id: string;
   chunk_id: string;
   page_start: number;
   page_end: number;
-  source_url: string;
+  source_url: string | null;
   section_title: string;
   quote: string;
   score: number;
+  evidence_type: string;
+  source_scope: string;
   image_ids: string[];
   images: CitationImage[];
 };
@@ -67,6 +69,7 @@ type ChatSession = {
   title: string;
   created_at: string;
   updated_at: string;
+  pinned: boolean;
 };
 
 type ChatMessage = {
@@ -94,6 +97,16 @@ type ChatResponse = {
   warnings: string[];
 };
 
+type ServerSentEvent = {
+  event: string;
+  data: Record<string, unknown>;
+};
+
+type ChatStage = {
+  stage: string;
+  label: string;
+};
+
 function App() {
   const [taskId, setTaskId] = useState("");
   const [documentId, setDocumentId] = useState("");
@@ -106,6 +119,7 @@ function App() {
   const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  const [chatStage, setChatStage] = useState<ChatStage | null>(null);
 
   const selectedDocument = useMemo(
     () => documents.find((document) => document.document_id === documentId),
@@ -136,12 +150,19 @@ function App() {
     const response = await fetch(`${API_BASE}/api/chat/sessions`);
     const data: { sessions: ChatSession[] } = await response.json();
     setSessions(data.sessions);
-    const nextSessionId = preferredSessionId ?? sessionId ?? data.sessions[0]?.session_id ?? "";
+    const preferred = preferredSessionId
+      ? data.sessions.find((session) => session.session_id === preferredSessionId)
+      : undefined;
+    const current = sessionId ? data.sessions.find((session) => session.session_id === sessionId) : undefined;
+    const nextSessionId = preferred?.session_id ?? current?.session_id ?? data.sessions[0]?.session_id ?? "";
     if (nextSessionId) {
       setSessionId(nextSessionId);
       if (options.loadMessages !== false) {
         await loadMessages(nextSessionId);
       }
+    } else {
+      setSessionId("");
+      setMessages([]);
     }
   }
 
@@ -159,6 +180,45 @@ function App() {
     setSessionId("");
     setMessages([]);
     setNotice("");
+    setChatStage(null);
+  }
+
+  async function toggleSessionPinned(session: ChatSession) {
+    try {
+      const response = await fetch(`${API_BASE}/api/chat/sessions/${session.session_id}/pin`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pinned: !session.pinned })
+      });
+      const data = await readResponsePayload(response);
+      if (!response.ok) {
+        setNotice(apiErrorMessage(data, "Could not update this chat."));
+        return;
+      }
+      await refreshSessions(sessionId || undefined, { loadMessages: false });
+    } catch {
+      setNotice("Could not update this chat. Please try again.");
+    }
+  }
+
+  async function deleteSession(targetSessionId: string) {
+    if (!window.confirm("Delete this chat history?")) return;
+    try {
+      const response = await fetch(`${API_BASE}/api/chat/sessions/${targetSessionId}`, { method: "DELETE" });
+      if (!response.ok) {
+        const data = await readResponsePayload(response);
+        setNotice(apiErrorMessage(data, "Could not delete this chat."));
+        return;
+      }
+      if (targetSessionId === sessionId) {
+        setSessionId("");
+        setMessages([]);
+        setChatStage(null);
+      }
+      await refreshSessions(undefined, { loadMessages: targetSessionId !== sessionId });
+    } catch {
+      setNotice("Could not delete this chat. Please try again.");
+    }
   }
 
   async function upload(files: FileList) {
@@ -167,10 +227,21 @@ function App() {
     setNotice("");
     const form = new FormData();
     selectedFiles.forEach((file) => form.append("files", file));
-    const response = await fetch(`${API_BASE}/api/documents/batch`, { method: "POST", body: form });
-    const data: BatchUploadResponse = await response.json();
-    if (!response.ok) {
-      setNotice((data as { detail?: string }).detail ?? "Upload failed.");
+    let response: Response;
+    let data: BatchUploadResponse | unknown;
+    try {
+      response = await fetch(`${API_BASE}/api/documents/batch`, { method: "POST", body: form });
+      data = await readResponsePayload(response);
+      if (!response.ok) {
+        setNotice(apiErrorMessage(data, uploadHttpFallback(response)));
+        return;
+      }
+    } catch {
+      setNotice("Upload failed. Please check that the API is running and try again.");
+      return;
+    }
+    if (!isBatchUploadResponse(data)) {
+      setNotice("Upload failed. The server returned an unexpected response.");
       return;
     }
 
@@ -191,17 +262,18 @@ function App() {
   async function pollTask(id: string, indexedDocumentId?: string) {
     try {
       const response = await fetch(`${API_BASE}/api/tasks/${id}`);
-      const data = await response.json();
+      const data = await readResponsePayload(response);
       if (!response.ok) {
-        setNotice(data.detail ?? "Task status is unavailable. Refreshing document states.");
+        setNotice(apiErrorMessage(data, "Task status is unavailable. Refreshing document states."));
         void refreshDocuments(indexedDocumentId);
         return;
       }
-      setTask(data);
-      if (["pending", "started", "running"].includes(data.status)) {
+      const taskData = data as Task;
+      setTask(taskData);
+      if (["pending", "started", "running"].includes(taskData.status)) {
         window.setTimeout(() => void pollTask(id, indexedDocumentId), 1500);
       }
-      if (["success", "failure", "failed"].includes(data.status)) {
+      if (["success", "failure", "failed"].includes(taskData.status)) {
         void refreshDocuments(indexedDocumentId);
       }
     } catch {
@@ -211,7 +283,8 @@ function App() {
   }
 
   async function ask() {
-    if (!question.trim()) return;
+    const submittedQuestion = question.trim();
+    if (!submittedQuestion) return;
     if (scope === "current_document" && !selectedDocument) {
       setNotice("Select a document first.");
       return;
@@ -229,9 +302,10 @@ function App() {
       return;
     }
 
-    const submittedQuestion = question;
     const tempUserMessageId = localMessageId("user");
+    const tempAssistantMessageId = localMessageId("assistant");
     const requestDocumentIds = scope === "current_document" && documentId ? [documentId] : [];
+    setQuestion("");
     setMessages((currentMessages) => [
       ...currentMessages,
       {
@@ -247,14 +321,29 @@ function App() {
         diagnostics_summary: {},
         created_at: new Date().toISOString(),
         status: "sending"
+      },
+      {
+        message_id: tempAssistantMessageId,
+        session_id: sessionId || `local-session-${tempAssistantMessageId}`,
+        role: "assistant",
+        content: "",
+        scope,
+        document_ids: requestDocumentIds,
+        citations: [],
+        images: [],
+        limitations: [],
+        diagnostics_summary: {},
+        created_at: new Date().toISOString(),
+        status: "sending"
       }
     ]);
     setBusy(true);
-    setNotice("正在检索文献并生成回答...");
+    setNotice("");
+    setChatStage({ stage: "planning", label: "正在规划检索路径" });
     const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), 90000);
+    const timeoutId = window.setTimeout(() => controller.abort(), 180000);
     try {
-      const response = await fetch(`${API_BASE}/api/chat`, {
+      const response = await fetch(`${API_BASE}/api/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: controller.signal,
@@ -265,24 +354,65 @@ function App() {
           document_ids: scope === "current_document" && documentId ? [documentId] : undefined
         })
       });
-      const data: ChatResponse & { detail?: string } = await response.json();
-      if (!response.ok) {
+      if (!response.ok || !response.body) {
+        const data = (await readResponsePayload(response)) as ChatResponse & { detail?: string };
         markMessageFailed(tempUserMessageId);
-        setNotice(data.detail ?? "Question failed.");
+        markMessageFailed(tempAssistantMessageId);
+        setNotice(apiErrorMessage(data, "Question failed."));
         return;
       }
-      setSessionId(data.session_id);
-      setQuestion("");
-      setMessages((currentMessages) => [
-        ...currentMessages.map((message) =>
-          message.message_id === tempUserMessageId ? data.user_message : message
-        ),
-        data.assistant_message
-      ]);
-      await refreshSessions(data.session_id, { loadMessages: false });
-      setNotice("");
+      let finalResponse: ChatResponse | null = null;
+      for await (const event of readServerSentEvents(response.body)) {
+        if (event.event === "stage") {
+          const nextStage = parseChatStage(event.data);
+          if (nextStage) setChatStage(nextStage);
+        }
+        if (event.event === "answer_delta") {
+          const delta = typeof event.data.delta === "string" ? event.data.delta : "";
+          if (!delta) continue;
+          setChatStage((currentStage) =>
+            currentStage?.stage === "answering" ? currentStage : { stage: "answering", label: "正在回答" }
+          );
+          setMessages((currentMessages) =>
+            currentMessages.map((message) =>
+              message.message_id === tempAssistantMessageId
+                ? { ...message, content: `${message.content}${delta}` }
+                : message
+            )
+          );
+        }
+        if (event.event === "error") {
+          markMessageFailed(tempUserMessageId);
+          markMessageFailed(tempAssistantMessageId);
+          setChatStage(null);
+          setNotice(apiErrorMessage(event.data, "Question failed."));
+          return;
+        }
+        if (event.event === "final") {
+          finalResponse = event.data as ChatResponse;
+          setSessionId(finalResponse.session_id);
+          setMessages((currentMessages) =>
+            currentMessages.map((message) => {
+              if (message.message_id === tempUserMessageId) return finalResponse!.user_message;
+              if (message.message_id === tempAssistantMessageId) return finalResponse!.assistant_message;
+              return message;
+            })
+          );
+          void refreshSessions(finalResponse.session_id, { loadMessages: false });
+          setChatStage(null);
+          setNotice("");
+        }
+      }
+      if (!finalResponse) {
+        markMessageFailed(tempUserMessageId);
+        markMessageFailed(tempAssistantMessageId);
+        setChatStage(null);
+        setNotice("Question failed. The server stream ended before sending a final answer.");
+      }
     } catch (error) {
       markMessageFailed(tempUserMessageId);
+      markMessageFailed(tempAssistantMessageId);
+      setChatStage(null);
       if (error instanceof DOMException && error.name === "AbortError") {
         setNotice("This question took too long. Try a narrower scope or ask about a specific figure, method, or result.");
       } else {
@@ -291,6 +421,7 @@ function App() {
     } finally {
       window.clearTimeout(timeoutId);
       setBusy(false);
+      setChatStage(null);
     }
   }
 
@@ -342,20 +473,21 @@ function App() {
               ))}
             </div>
           )}
+        </aside>
 
-          <section className="sessions">
-            <header>
-              <h2>Chats</h2>
-              <button onClick={startNewChat}>New</button>
-            </header>
-            {sessions.length === 0 ? (
-              <p className="empty">Ask a question to start a chat.</p>
-            ) : (
-              <div className="session-list">
-                {sessions.map((session) => (
+        <aside className="sessions">
+          <header>
+            <h2>Chats</h2>
+            <button onClick={startNewChat}>New</button>
+          </header>
+          {sessions.length === 0 ? (
+            <p className="empty">Ask a question to start a chat.</p>
+          ) : (
+            <div className="session-list">
+              {sessions.map((session) => (
+                <article className={session.session_id === sessionId ? "session active" : "session"} key={session.session_id}>
                   <button
-                    className={session.session_id === sessionId ? "session active" : "session"}
-                    key={session.session_id}
+                    className="session-main"
                     onClick={() => {
                       setSessionId(session.session_id);
                       void loadMessages(session.session_id);
@@ -364,10 +496,26 @@ function App() {
                     <span>{session.title}</span>
                     <small>{formatSessionTime(session.updated_at)}</small>
                   </button>
-                ))}
-              </div>
-            )}
-          </section>
+                  <div className="session-actions">
+                    <button
+                      aria-label={session.pinned ? "Unpin chat" : "Pin chat"}
+                      onClick={() => void toggleSessionPinned(session)}
+                      title={session.pinned ? "Unpin chat" : "Pin chat"}
+                    >
+                      {session.pinned ? <PinOff size={16} /> : <Pin size={16} />}
+                    </button>
+                    <button
+                      aria-label="Delete chat"
+                      onClick={() => void deleteSession(session.session_id)}
+                      title="Delete chat"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
         </aside>
 
         <section className="chat">
@@ -382,6 +530,11 @@ function App() {
             </div>
           )}
           {notice && <div className="notice">{notice}</div>}
+          {busy && chatStage && (
+            <div className={`stage-hint ${chatStage.stage}`} aria-live="polite">
+              {chatStage.label}
+            </div>
+          )}
           <div className="messages">
             {messages.length === 0 ? (
               <article className="placeholder">Ask a question after indexing a paper.</article>
@@ -389,12 +542,18 @@ function App() {
               messages.map((message) => <ChatMessageView key={message.message_id} message={message} />)
             )}
           </div>
-          <div className="composer">
+          <form
+            className="composer"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!busy) void ask();
+            }}
+          >
             <input value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="Ask about mechanisms, methods, or results..." />
-            <button onClick={ask} disabled={busy}>
+            <button type="submit" disabled={busy}>
               <Send size={18} />
             </button>
-          </div>
+          </form>
         </section>
       </section>
     </main>
@@ -408,7 +567,7 @@ function ChatMessageView({ message }: { message: ChatMessage }) {
   const selectedCitationImages = collectCitationImages(message.citations ?? []);
   return (
     <article className="message assistant-message">
-      <div className="answer">{message.content}</div>
+      <div className="answer">{message.content || (message.status === "sending" ? "正在生成..." : "")}</div>
       {message.limitations.length > 0 && (
         <div className="limitations">
           <strong>资料限制</strong>
@@ -437,10 +596,17 @@ function ChatMessageView({ message }: { message: ChatMessage }) {
       {message.citations.map((citation) => (
         <article className="citation" key={citation.chunk_id}>
           <header>
-            <a className="citation-source" href={`${API_BASE}${citation.source_url}`} rel="noreferrer" target="_blank">
-              <strong>{citation.section_title}</strong>
-              <span>p. {citation.page_start}-{citation.page_end}</span>
-            </a>
+            {citation.source_url ? (
+              <a className="citation-source" href={`${API_BASE}${citation.source_url}`} rel="noreferrer" target="_blank">
+                <strong>{citation.section_title}</strong>
+                <span>p. {citation.page_start}-{citation.page_end}</span>
+              </a>
+            ) : (
+              <div className="citation-source">
+                <strong>{citation.section_title}</strong>
+                <span>{citation.source_scope === "document_level" ? "文档画像" : citation.evidence_type}</span>
+              </div>
+            )}
           </header>
           <p>{citation.quote}</p>
           {(citation.images ?? []).length > 0 && (
@@ -513,6 +679,89 @@ function formatSessionTime(value: string) {
 
 function localMessageId(role: ChatMessage["role"]) {
   return `local-${role}-${crypto.randomUUID()}`;
+}
+
+function apiErrorMessage(payload: unknown, fallback: string) {
+  if (payload && typeof payload === "object") {
+    const data = payload as { detail?: unknown; error?: { message?: unknown } };
+    if (typeof data.error?.message === "string") return data.error.message;
+    if (typeof data.detail === "string") return data.detail;
+  }
+  if (typeof payload === "string" && payload.trim()) return payload;
+  return fallback;
+}
+
+async function readResponsePayload(response: Response) {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    return response.json();
+  }
+  const text = await response.text();
+  return text.trim();
+}
+
+async function* readServerSentEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<ServerSentEvent> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split(/\r?\n\r?\n/);
+      buffer = frames.pop() ?? "";
+      for (const frame of frames) {
+        const event = parseServerSentEvent(frame);
+        if (event) yield event;
+      }
+    }
+    buffer += decoder.decode();
+    const tail = parseServerSentEvent(buffer);
+    if (tail) yield tail;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function parseServerSentEvent(frame: string): ServerSentEvent | null {
+  const lines = frame.split(/\r?\n/);
+  const event = lines.find((line) => line.startsWith("event:"))?.slice("event:".length).trim() || "message";
+  const dataLines = lines
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice("data:".length).trimStart());
+  if (dataLines.length === 0) return null;
+  try {
+    const data = JSON.parse(dataLines.join("\n")) as Record<string, unknown>;
+    return { event, data };
+  } catch {
+    return null;
+  }
+}
+
+function parseChatStage(payload: Record<string, unknown>): ChatStage | null {
+  const stage = typeof payload.stage === "string" ? payload.stage : "";
+  const label = typeof payload.label === "string" ? payload.label : "";
+  if (!stage || !label) return null;
+  return { stage, label };
+}
+
+function uploadHttpFallback(response: Response) {
+  if (response.status === 413) {
+    return "Upload failed. The PDF is larger than the server upload limit.";
+  }
+  if (response.status === 502 || response.status === 503 || response.status === 504) {
+    return "Upload failed. The API service is not available.";
+  }
+  return "Upload failed.";
+}
+
+function isBatchUploadResponse(payload: unknown): payload is BatchUploadResponse {
+  return Boolean(
+    payload &&
+      typeof payload === "object" &&
+      Array.isArray((payload as BatchUploadResponse).results)
+  );
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

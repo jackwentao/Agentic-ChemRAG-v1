@@ -36,10 +36,12 @@ def evaluate_case_metrics(
     stop_reason: str | None = None,
     assessment_rounds: list[dict[str, Any]] | None = None,
     llm_call_counts: dict[str, int] | None = None,
+    answer_verification: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     limitations = limitations or []
     assessment_rounds = assessment_rounds or []
     llm_call_counts = llm_call_counts or {}
+    answer_verification = answer_verification or {}
     metrics: dict[str, Any] = {
         "route_hit": actual_route == case.expected_route,
         "target_type": case.target_type,
@@ -88,8 +90,38 @@ def evaluate_case_metrics(
     metrics["assessment_round_count"] = len(assessment_rounds)
     metrics["assessment_llm_calls"] = int(llm_call_counts.get("evidence_assessment", 0))
     metrics["answer_llm_calls"] = int(llm_call_counts.get("answer_generation", 0))
-    metrics["total_tracked_llm_calls"] = metrics["assessment_llm_calls"] + metrics["answer_llm_calls"]
+    metrics["answer_verification_llm_calls"] = int(llm_call_counts.get("answer_verification", 0))
+    metrics["answer_revision_llm_calls"] = int(llm_call_counts.get("answer_revision", 0))
+    metrics["image_selection_llm_calls"] = int(llm_call_counts.get("image_selection", 0))
+    metrics["answer_verification_triggered"] = bool(answer_verification.get("triggered", False))
+    metrics["answer_verification_passed"] = bool(answer_verification.get("passed", True))
+    metrics["answer_revision_required"] = bool(answer_verification.get("revision_required", False))
+    metrics["answer_revision_applied"] = bool(answer_verification.get("revision_applied", False))
+    metrics["unsupported_claim_count"] = int(answer_verification.get("unsupported_claim_count", 0) or 0)
+    metrics["missing_disclosure_count"] = int(answer_verification.get("missing_disclosure_count", 0) or 0)
+    metrics["citation_error_count"] = int(answer_verification.get("citation_error_count", 0) or 0)
+    metrics["overstatement_count"] = int(answer_verification.get("overstatement_count", 0) or 0)
+    metrics["final_answer_accepted"] = _final_answer_accepted(metrics)
+    metrics["total_tracked_llm_calls"] = (
+        metrics["assessment_llm_calls"]
+        + metrics["answer_llm_calls"]
+        + metrics["answer_verification_llm_calls"]
+        + metrics["answer_revision_llm_calls"]
+        + metrics["image_selection_llm_calls"]
+    )
     return metrics
+
+
+def _final_answer_accepted(metrics: dict[str, Any]) -> bool:
+    if metrics["answer_verification_passed"]:
+        return True
+    if not metrics["answer_revision_applied"]:
+        return False
+    return (
+        metrics["unsupported_claim_count"] == 0
+        and metrics["missing_disclosure_count"] == 0
+        and metrics["overstatement_count"] == 0
+    )
 
 
 def ranking_metrics(
@@ -138,7 +170,11 @@ def selected_figure_hit(
 
 
 def source_urls_valid(citations: list[dict[str, Any]], selected_images: list[dict[str, Any]]) -> bool:
-    urls = [citation.get("source_url") for citation in citations]
+    urls = [
+        citation.get("source_url")
+        for citation in citations
+        if not (citation.get("source_scope") == "document_level" and citation.get("source_url") is None)
+    ]
     urls.extend(image.get("source_url") for image in selected_images)
     return all(isinstance(url, str) and PDF_SOURCE_URL_PATTERN.match(url) for url in urls)
 
@@ -191,6 +227,7 @@ def summarize_latencies(results: list[dict[str, Any]]) -> dict[str, dict[str, fl
         "latency_total_ms",
         "latency_retrieval_ms",
         "latency_assessment_ms",
+        "latency_answer_verification_ms",
         "latency_rerank_ms",
         "latency_answer_ms",
     ]:

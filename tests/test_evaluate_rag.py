@@ -41,7 +41,7 @@ class FakeGraph:
                     {"round_index": 1, "latency_ms": 1.2, "sufficient": False},
                     {"round_index": 2, "latency_ms": 1.5, "sufficient": True},
                 ],
-                "llm_call_counts": {"evidence_assessment": 2, "answer_generation": 0},
+                "llm_call_counts": {"evidence_assessment": 2, "answer_generation": 0, "image_selection": 1},
             },
         }
 
@@ -49,6 +49,22 @@ class FakeGraph:
 class FailingJudge:
     def score(self, **kwargs):
         raise RuntimeError("judge unavailable")
+
+
+class FakeRagasRunner:
+    def __init__(self) -> None:
+        self.rows = []
+
+    def evaluate(self, rows):
+        self.rows = rows
+        return {
+            "enabled": True,
+            "summary": {"faithfulness": 0.8},
+            "metrics": ["faithfulness"],
+            "skipped_metrics": [],
+            "errors": [],
+            "results": [{"case_id": "c1", "metrics": {"faithfulness": 0.8}}],
+        }
 
 
 class RecordingEmbedding:
@@ -135,9 +151,10 @@ def test_evaluate_cases_records_route_metrics_outputs_and_latencies():
     assert result["latency_rerank_ms"] == 2.5
     assert result["rerank_enabled"] is True
     assert result["latency_assessment_ms"] == 2.7
-    assert result["llm_call_counts"] == {"evidence_assessment": 2, "answer_generation": 0}
+    assert result["llm_call_counts"] == {"evidence_assessment": 2, "answer_generation": 0, "image_selection": 1}
     assert result["metrics"]["observed_retry_success"] is True
-    assert result["metrics"]["total_tracked_llm_calls"] == 2
+    assert result["metrics"]["image_selection_llm_calls"] == 1
+    assert result["metrics"]["total_tracked_llm_calls"] == 3
     assert result["diagnostics"]["rerank"]["candidate_count"] == 8
     assert "by_expected_route" in report["summary"]
     assert "by_task_category" in report["summary"]
@@ -156,6 +173,20 @@ def test_evaluate_cases_records_judge_errors_without_failing():
     report = evaluate_cases([make_case()], graph=FakeGraph(), top_k=5, judge=FailingJudge())
 
     assert report["results"][0]["judge_error"] == "judge unavailable"
+
+
+def test_evaluate_cases_merges_ragas_scores_and_passes_full_contexts():
+    ragas_runner = FakeRagasRunner()
+
+    report = evaluate_cases([make_case()], graph=FakeGraph(), top_k=5, ragas_runner=ragas_runner)
+
+    assert report["ragas"]["enabled"] is True
+    assert report["ragas"]["summary"] == {"faithfulness": 0.8}
+    assert report["results"][0]["ragas"]["metrics"]["faithfulness"] == 0.8
+    assert ragas_runner.rows[0]["case_id"] == "c1"
+    assert ragas_runner.rows[0]["user_input"] == "What figures are shown?"
+    assert ragas_runner.rows[0]["response"] == "Fig. 2 shows the PL spectrum of ZnO."
+    assert ragas_runner.rows[0]["retrieved_contexts"] == ["Fig. 2 PL spectrum of ZnO."]
 
 
 def test_render_markdown_report_includes_expected_sections():

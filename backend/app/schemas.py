@@ -67,6 +67,11 @@ class ChatSessionSummary(BaseModel):
     title: str
     created_at: str
     updated_at: str
+    pinned: bool = False
+
+
+class ChatSessionPinRequest(BaseModel):
+    pinned: bool
 
 
 class ChatMessage(BaseModel):
@@ -109,10 +114,12 @@ class Citation(BaseModel):
     chunk_id: str
     page_start: int
     page_end: int
-    source_url: str
+    source_url: str | None
     section_title: str
     quote: str
     score: float
+    evidence_type: str = "chunk"
+    source_scope: str = "page_span"
     image_ids: list[str] = []
     images: list[CitationImage] = []
 
@@ -128,6 +135,26 @@ class RouteDiagnostics(BaseModel):
     lexical_scores: dict[str, float] = Field(default_factory=dict)
     semantic_scores: dict[str, float] = Field(default_factory=dict)
     rationale: list[str] = Field(default_factory=list)
+
+
+class OutlineResolutionDiagnostics(BaseModel):
+    original_question: str = ""
+    rewritten_question: str = ""
+    basic_facts: list[str] = Field(default_factory=list)
+    decision: str = "pass_through"
+    target_document_ids: list[str] = Field(default_factory=list)
+    needs_outline_retrieval: bool = False
+    reason: str = ""
+
+
+class OutlineContextDiagnostics(BaseModel):
+    injected: bool = False
+    evidence_count: int = 0
+    document_ids: list[str] = Field(default_factory=list)
+    latency_ms: float = 0.0
+    query: str = ""
+    reason: str = ""
+    evidence: list[dict[str, object]] = Field(default_factory=list)
 
 
 class RoutePlanStepDiagnostics(BaseModel):
@@ -251,6 +278,42 @@ class AssessmentRoundDiagnostics(BaseModel):
 class LlmCallCountsDiagnostics(BaseModel):
     evidence_assessment: int = 0
     answer_generation: int = 0
+    answer_verification: int = 0
+    answer_revision: int = 0
+    image_selection: int = 0
+
+
+class AnswerVerificationDiagnostics(BaseModel):
+    latency_ms: float = 0.0
+    triggered: bool = False
+    passed: bool = True
+    trigger_reasons: list[str] = Field(default_factory=list)
+    unsupported_claim_count: int = 0
+    missing_disclosure_count: int = 0
+    citation_error_count: int = 0
+    overstatement_count: int = 0
+    unsupported_claims: list[str] = Field(default_factory=list)
+    missing_disclosures: list[str] = Field(default_factory=list)
+    citation_errors: list[str] = Field(default_factory=list)
+    overstatements: list[str] = Field(default_factory=list)
+    revision_required: bool = False
+    revision_applied: bool = False
+    revision_instruction: str | None = None
+    used_llm: bool = False
+    fallback_used: bool = False
+    reason: str = ""
+    proxy_hit: bool = False
+
+
+class ImageSelectionDiagnostics(BaseModel):
+    strategy: str = "none"
+    used_llm: bool = False
+    fallback_used: bool = False
+    candidate_count: int = 0
+    selected_count: int = 0
+    latency_ms: float = 0.0
+    reason: str = ""
+    proxy_hit: bool = False
 
 
 class ChatDiagnostics(BaseModel):
@@ -261,12 +324,16 @@ class ChatDiagnostics(BaseModel):
     retrieval_rounds: list[RetrievalRoundDiagnostics] = Field(default_factory=list)
     assessment_rounds: list[AssessmentRoundDiagnostics] = Field(default_factory=list)
     llm_call_counts: LlmCallCountsDiagnostics = Field(default_factory=LlmCallCountsDiagnostics)
+    outline_resolution: OutlineResolutionDiagnostics | None = None
+    outline_context: OutlineContextDiagnostics | None = None
     route: RouteDiagnostics | None = None
     route_plan: RoutePlanDiagnostics | None = None
     task: TaskDiagnostics | None = None
     recall: RecallDiagnostics | None = None
     rerank: RerankDiagnostics | None = None
     verifier: VerifierDiagnostics | None = None
+    answer_verification: AnswerVerificationDiagnostics | None = None
+    image_selection: ImageSelectionDiagnostics | None = None
     llm: LlmDiagnostics | None = None
 
 

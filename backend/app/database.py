@@ -26,6 +26,7 @@ def prepare_database(engine: Engine) -> None:
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS indexed_at TIMESTAMPTZ"))
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS indexing_updated_at TIMESTAMPTZ NOT NULL DEFAULT now()"))
         conn.execute(text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS pdf_object_key TEXT"))
+        conn.execute(text("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo'"))
         conn.execute(text("ALTER TABLE images ADD COLUMN IF NOT EXISTS label TEXT"))
         conn.execute(text("ALTER TABLE images ADD COLUMN IF NOT EXISTS caption TEXT"))
         conn.execute(text("ALTER TABLE images ADD COLUMN IF NOT EXISTS nearby_text TEXT"))
@@ -65,9 +66,13 @@ def prepare_database(engine: Engine) -> None:
                     document_id TEXT PRIMARY KEY,
                     title TEXT,
                     abstract TEXT,
+                    conclusion TEXT,
                     summary_text TEXT NOT NULL,
                     topics JSONB NOT NULL DEFAULT '[]'::jsonb,
                     entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    profile_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    outline_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                     figure_summary TEXT,
                     embedding VECTOR(1024),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -75,6 +80,33 @@ def prepare_database(engine: Engine) -> None:
                 """
             )
         )
+        conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS conclusion TEXT"))
+        conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo'"))
+        conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS profile_json JSONB NOT NULL DEFAULT '{}'::jsonb"))
+        conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS outline_json JSONB NOT NULL DEFAULT '[]'::jsonb"))
+        conn.execute(text("ALTER TABLE document_profiles ADD COLUMN IF NOT EXISTS source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS document_profile_embeddings (
+                    profile_field_id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    field_text TEXT NOT NULL,
+                    source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    embedding VECTOR(1024),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+        conn.execute(text("ALTER TABLE document_profile_embeddings ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo'"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS document_profile_embeddings_document_idx ON document_profile_embeddings (document_id, field_name)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS chunks_owner_document_idx ON chunks (owner_id, document_id, chunk_type)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS chunks_text_simple_tsv_idx ON chunks USING gin (to_tsvector('simple', text))"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS document_profiles_owner_document_idx ON document_profiles (owner_id, document_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS document_profile_embeddings_owner_document_idx ON document_profile_embeddings (owner_id, document_id, field_name)"))
         conn.execute(
             text(
                 """
@@ -82,12 +114,14 @@ def prepare_database(engine: Engine) -> None:
                     session_id TEXT PRIMARY KEY,
                     owner_id TEXT NOT NULL DEFAULT 'demo',
                     title TEXT NOT NULL,
+                    pinned BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
                 """
             )
         )
+        conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE"))
         conn.execute(
             text(
                 """
@@ -132,6 +166,42 @@ def prepare_database(engine: Engine) -> None:
         conn.execute(
             text(
                 """
+                UPDATE chunks
+                SET owner_id = documents.owner_id
+                FROM documents
+                WHERE chunks.document_id = documents.document_id
+                  AND chunks.owner_id = 'demo'
+                  AND documents.owner_id <> 'demo'
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE document_profiles
+                SET owner_id = documents.owner_id
+                FROM documents
+                WHERE document_profiles.document_id = documents.document_id
+                  AND document_profiles.owner_id = 'demo'
+                  AND documents.owner_id <> 'demo'
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE document_profile_embeddings
+                SET owner_id = documents.owner_id
+                FROM documents
+                WHERE document_profile_embeddings.document_id = documents.document_id
+                  AND document_profile_embeddings.owner_id = 'demo'
+                  AND documents.owner_id <> 'demo'
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
                 UPDATE documents
                 SET indexing_status = 'succeeded',
                     indexing_error = NULL,
@@ -146,7 +216,7 @@ def prepare_database(engine: Engine) -> None:
             )
         )
         conn.execute(text("CREATE INDEX IF NOT EXISTS figures_document_page_idx ON figures (document_id, page)"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS chat_sessions_owner_updated_idx ON chat_sessions (owner_id, updated_at DESC)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS chat_sessions_owner_pinned_updated_idx ON chat_sessions (owner_id, pinned DESC, updated_at DESC)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS chat_messages_session_created_idx ON chat_messages (session_id, created_at ASC)"))
         conn.execute(
             text(
@@ -160,9 +230,17 @@ def prepare_database(engine: Engine) -> None:
         conn.execute(
             text(
                 """
-                CREATE INDEX IF NOT EXISTS document_profiles_embedding_idx
-                ON document_profiles USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = 100)
+                CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw_idx
+                ON chunks USING hnsw (embedding vector_cosine_ops)
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                -- document_profiles 是单用户文档级画像，默认规模较小。
+                -- 删除历史 ivfflat 索引，让查询保持精确全表向量排序，避免近似召回遗漏。
+                DROP INDEX IF EXISTS document_profiles_embedding_idx
                 """
             )
         )

@@ -2,6 +2,10 @@
 
 Agentic-ChemRAG 是面向化学与材料科学论文的多智能体 RAG 系统。它支持 PDF 上传、异步解析与索引、基于文档范围的提问、页码引用以及关联图片返回。
 
+## 项目演示
+
+- 演示视频已发布到 GitHub Issue：[项目演示视频（Issue #2）](https://github.com/jackwentao/Agentic-ChemRAG/issues/2)
+
 ## 架构概览
 
 - FastAPI 提供上传、任务状态、文档列表、图片和问答接口。

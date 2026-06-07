@@ -49,6 +49,7 @@ WHERE file_hash IS NOT NULL;
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id TEXT PRIMARY KEY,
     document_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL DEFAULT 'demo',
     parent_id TEXT,
     text TEXT NOT NULL,
     page_start INTEGER NOT NULL,
@@ -58,6 +59,9 @@ CREATE TABLE IF NOT EXISTS chunks (
     chunk_type TEXT NOT NULL,
     embedding VECTOR(1024)
 );
+
+ALTER TABLE chunks
+ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo';
 
 CREATE TABLE IF NOT EXISTS images (
     image_id TEXT PRIMARY KEY,
@@ -108,15 +112,41 @@ CREATE TABLE IF NOT EXISTS figures (
 
 CREATE TABLE IF NOT EXISTS document_profiles (
     document_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL DEFAULT 'demo',
     title TEXT,
     abstract TEXT,
+    conclusion TEXT,
     summary_text TEXT NOT NULL,
     topics JSONB NOT NULL DEFAULT '[]'::jsonb,
     entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+    profile_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    outline_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb,
     figure_summary TEXT,
     embedding VECTOR(1024),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE document_profiles
+ADD COLUMN IF NOT EXISTS conclusion TEXT;
+
+ALTER TABLE document_profiles
+ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo';
+
+CREATE TABLE IF NOT EXISTS document_profile_embeddings (
+    profile_field_id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL DEFAULT 'demo',
+    field_name TEXT NOT NULL,
+    field_text TEXT NOT NULL,
+    source_refs_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+    embedding VECTOR(1024),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE document_profile_embeddings
+ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'demo';
 
 CREATE TABLE IF NOT EXISTS chat_sessions (
     session_id TEXT PRIMARY KEY,
@@ -152,6 +182,21 @@ CREATE INDEX IF NOT EXISTS chunks_embedding_idx
 ON chunks USING ivfflat (embedding vector_cosine_ops)
 WITH (lists = 100);
 
+CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw_idx
+ON chunks USING hnsw (embedding vector_cosine_ops);
+
+CREATE INDEX IF NOT EXISTS chunks_owner_document_idx
+ON chunks (owner_id, document_id, chunk_type);
+
+CREATE INDEX IF NOT EXISTS chunks_text_simple_tsv_idx
+ON chunks USING gin (to_tsvector('simple', text));
+
+CREATE INDEX IF NOT EXISTS document_profiles_owner_document_idx
+ON document_profiles (owner_id, document_id);
+
+CREATE INDEX IF NOT EXISTS document_profile_embeddings_owner_document_idx
+ON document_profile_embeddings (owner_id, document_id, field_name);
+
 UPDATE documents
 SET indexing_status = 'succeeded',
     indexing_error = NULL,
@@ -169,6 +214,9 @@ ON images (document_id, page);
 CREATE INDEX IF NOT EXISTS figures_document_page_idx
 ON figures (document_id, page);
 
+CREATE INDEX IF NOT EXISTS document_profile_embeddings_document_idx
+ON document_profile_embeddings (document_id, field_name);
+
 CREATE INDEX IF NOT EXISTS chat_sessions_owner_updated_idx
 ON chat_sessions (owner_id, updated_at DESC);
 
@@ -179,6 +227,6 @@ CREATE INDEX IF NOT EXISTS figures_embedding_idx
 ON figures USING ivfflat (embedding vector_cosine_ops)
 WITH (lists = 100);
 
-CREATE INDEX IF NOT EXISTS document_profiles_embedding_idx
-ON document_profiles USING ivfflat (embedding vector_cosine_ops)
-WITH (lists = 100);
+-- document_profiles 是单用户文档级画像，默认规模较小。
+-- 这里不创建 ivfflat 近似索引，保留精确全表向量排序，避免文档级召回遗漏。
+DROP INDEX IF EXISTS document_profiles_embedding_idx;

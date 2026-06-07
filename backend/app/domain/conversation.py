@@ -8,6 +8,7 @@ class ConversationSession:
     title: str
     created_at: str
     updated_at: str
+    pinned: bool = False
 
 
 @dataclass(frozen=True)
