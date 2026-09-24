@@ -288,7 +288,7 @@ class QueryRouter:
                 "该文献主要研究什么",
                 "主要研究什么",
             ],
-        )
+        ) or _has_document_about_summary_signal(normalized)
         generic_summary_signal = _has_any(
             normalized,
             ["summarize", "summary", "总结", "概述", "概括", "梳理"],
@@ -595,6 +595,16 @@ def _has_chinese_figure_listing_signal(text: str) -> bool:
     return bool(
         re.search(rf"(?:哪些|有哪(?:些)?|有什么|列出|列举|展示|显示|查看|看一下|给我看).{{0,16}}{figure_object}", text)
         or re.search(rf"{figure_object}.{{0,12}}(?:有哪些|有哪(?:些)?|是什么|列表|清单)", text)
+    )
+
+
+def _has_document_about_summary_signal(text: str) -> bool:
+    # 单文档指代解析会把 “this paper” 改写为 “文档 <id>”，
+    # 这里保留整体论文问题的意图，避免被误判为局部事实问答。
+    return bool(
+        re.search(r"\bwhat\s+is\s+(?:the\s+)?(?:paper|document|article)\b.{0,80}\babout\b", text)
+        or re.search(r"\bwhat\s+is\s+文档\b.{0,80}\babout\b", text)
+        or re.search(r"(?:文档|论文|文献|文章).{0,80}(?:讲什么|主要研究什么|关于什么|是什么主题)", text)
     )
 
 

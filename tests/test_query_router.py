@@ -25,6 +25,18 @@ def test_router_routes_chinese_holistic_and_cross_document_questions_to_profile(
     assert cross.route == "document_profile"
 
 
+def test_router_keeps_rewritten_single_document_about_question_on_profile_route():
+    router = QueryRouter()
+
+    decision = router.route(
+        "What is 文档 a79cad02551c40618e59347dacd818ff about?",
+        RouteContext(scope="current_document", document_ids=["a79cad02551c40618e59347dacd818ff"]),
+    )
+
+    assert decision.route == "document_profile"
+    assert "document_summary_signal" in decision.rationale
+
+
 def test_router_routes_explicit_figure_questions_to_figure_index():
     router = QueryRouter()
 

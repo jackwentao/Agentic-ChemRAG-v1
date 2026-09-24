@@ -546,6 +546,28 @@ def _normalize_scientific_ocr_text(text: str | None) -> tuple[str | None, list[s
         silicon_substrate_repl,
         text,
     )
+    mojibake_replacements = {
+        "â": "-",
+        "â": "-",
+        "â": "-",
+        "â": "-",
+        "â": "-",
+        "â": "'",
+        "â": "'",
+        "â": '"',
+        "â": '"',
+        "â¢": "*",
+        "â¦": "...",
+        "â¯": " ",
+        "Â ": " ",
+        "Â°": "deg",
+        "Â±": "+/-",
+        "Â·": ".",
+    }
+    for noisy, clean in mojibake_replacements.items():
+        if noisy in normalized:
+            normalized = normalized.replace(noisy, clean)
+            changes.append("common_utf8_mojibake")
     return normalized, sorted(set(changes))
 
 

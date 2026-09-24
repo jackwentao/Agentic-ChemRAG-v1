@@ -268,6 +268,34 @@ def test_retrieve_normalizes_known_scientific_ocr_noise_before_answering():
     assert figure.metadata["scientific_ocr_normalizations"] == ["zno_silicon_substrate_plane"]
 
 
+def test_retrieve_normalizes_common_utf8_mojibake_before_answering():
+    class MojibakeRepository(HybridRepository):
+        def search(self, query_embedding, top_k=5, document_ids=None, owner_id=None, search_strategy="hnsw", exact_timeout_ms=None):
+            return [
+                Evidence(
+                    chunk_id="c-mojibake",
+                    document_id="doc1",
+                    text="The laser wavelength was 1064â¯nm and the response was solventâdependent.",
+                    page_start=5,
+                    page_end=5,
+                    section_title="Results",
+                    score=0.9,
+                )
+            ]
+
+    service = RetrievalService(
+        MojibakeRepository(),
+        FakeEmbeddingProvider(dimensions=8),
+        reranker_enabled=False,
+    )
+
+    results = service.retrieve("What laser wavelength was used?", top_k=3)
+
+    normalized = next(item for item in results if item.chunk_id == "c-mojibake")
+    assert normalized.text == "The laser wavelength was 1064 nm and the response was solvent-dependent."
+    assert normalized.metadata["scientific_ocr_normalizations"] == ["common_utf8_mojibake"]
+
+
 def test_retrieve_normalizes_figure_sidecar_when_it_replaces_top_k_result():
     class SidecarReplacementRepository(HybridRepository):
         def search(self, query_embedding, top_k=5, document_ids=None, owner_id=None, search_strategy="hnsw", exact_timeout_ms=None):
