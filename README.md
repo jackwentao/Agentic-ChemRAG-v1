@@ -1,10 +1,19 @@
-# Agentic-ChemRAG
+# Agentic-ChemRAG-v1
 
-Agentic-ChemRAG 是面向化学与材料科学论文的多智能体 RAG 系统。它支持 PDF 上传、异步解析与索引、基于文档范围的提问、页码引用以及关联图片返回。
+**面向化学与材料文献的 PDF 上传、索引与问答应用。** 支持异步解析、文档范围提问、页码引用和关联图片返回。
 
-## 项目演示
+[演示视频](https://github.com/jackwentao/Agentic-ChemRAG/issues/2) · [架构](docs/ARCHITECTURE.md) · [测试指南](docs/TESTING.md)
 
-- 演示视频已发布到 GitHub Issue：[项目演示视频（Issue #2）](https://github.com/jackwentao/Agentic-ChemRAG/issues/2)
+
+## ChemRAG 仓库导航
+
+三个仓库分别探索不同实现路线，源码与运行环境各自独立：
+
+| 仓库 | 定位 | 核心实现 |
+| --- | --- | --- |
+| [Agentic-ChemRAG](https://github.com/jackwentao/Agentic-ChemRAG) | 早期文献问答原型 | 本地 PDF、ChromaDB、LangChain、React |
+| [Agentic-ChemRAG-v1](https://github.com/jackwentao/Agentic-ChemRAG-v1) | 文档上传与问答应用 | pgvector、Celery、MinIO、LangGraph、页码引用 |
+| [Multi_Agent_ChemRAG](https://github.com/jackwentao/Multi_Agent_ChemRAG) | 模块化后端与编排实验 | 核心契约、异步导入、共享仓储、Agent 工作流骨架 |
 
 ## 架构概览
 
@@ -16,9 +25,9 @@ Agentic-ChemRAG 是面向化学与材料科学论文的多智能体 RAG 系统�
 - LangGraph 编排检索、验证、回答与引用流程。
 - React + Vite 提供上传和引用感知的问答界面。
 
-## 一次跑通上传与提问
+## 快速开始
 
-以下步骤以 Windows PowerShell 为例。首次运行需要 Docker Desktop、Python 3.11+、Node.js、可用的 DeepSeek API Key，以及下载本地模型所需的网络。
+以下步骤以 Windows PowerShell 为例。首次运行需要 Docker Desktop、Python 3.11+、Node.js 18+ 与 npm、可用的 DeepSeek API Key，以及下载本地模型所需的网络。
 
 ### 1. 安装依赖并启动基础服务
 
@@ -105,3 +114,22 @@ npm run build
 ```
 
 更多测试与排错命令见 [docs/TESTING.md](docs/TESTING.md)，架构说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
+## 目录与文档
+
+```text
+backend/app/   API、文档导入、检索、LangGraph、仓储与模型适配
+frontend/      React / TypeScript / Vite 问答界面
+scripts/       安装、启动、索引维护与端到端冒烟
+tests/         后端测试
+eval/          评测样例
+migrations/    数据库迁移
+docs/          架构、验证与评测说明
+```
+
+- [.env.example](.env.example)：模型、数据库、对象存储与上传配置。
+- [架构说明](docs/ARCHITECTURE.md) · [路由规划](docs/ROUTE_PLAN_ARCHITECTURE.md)。
+- [测试指南](docs/TESTING.md) · [RAGAS 评测](docs/RAGAS_EVALUATION.md)。
+- [检索交付门槛](docs/RETRIEVAL_DELIVERABLE_GATE.md) · [生产加固计划](docs/PRODUCTION_HARDENING_PLAN.md)。
+
+`eval/` 和测试脚本用于复现评测；历史验证报告对应其记录的版本、配置和日期。
